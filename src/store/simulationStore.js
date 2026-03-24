@@ -8,6 +8,45 @@
 import { create } from 'zustand';
 import { defaultConfig } from '../data/defaultConfig.js';
 
+function createDefaultUserPortfolio(config = defaultConfig) {
+  return {
+    id: 'user',
+    canShort: true,
+    cash: config.userStartingBalance,
+    position: 0,
+    avgPrice: 0,
+    averageLongEntryPrice: 0,
+    averageShortEntryPrice: 0,
+    realizedPnL: 0,
+    unrealizedPnL: 0,
+    realizedLongPnL: 0,
+    realizedShortPnL: 0,
+    unrealizedLongPnL: 0,
+    unrealizedShortPnL: 0,
+    shortPositionSize: 0,
+    borrowInUse: 0,
+    reservedBorrow: 0,
+    equity: config.userStartingBalance,
+    marginRatio: null,
+    leverage: 0,
+  };
+}
+
+function createDefaultShortSellingState(config = defaultConfig) {
+  return {
+    enabled: !!config.shortSellingEnabled,
+    borrowAvailable: !!config.borrowAvailable,
+    borrowPoolSize: config.borrowPoolSize,
+    borrowPoolRemaining: config.borrowPoolSize,
+    activeBorrow: 0,
+    reservedBorrow: 0,
+    shortEnabledAgentCount: 0,
+    activeShortCount: 0,
+    forcedCoverCount: 0,
+    lastForcedCoverTick: null,
+  };
+}
+
 export const useSimulationStore = create((set, get) => ({
   // --- Simulation control ---
   isRunning: false,
@@ -80,11 +119,31 @@ export const useSimulationStore = create((set, get) => ({
 
   // --- User trading ---
   userBalance: defaultConfig.userStartingBalance,
-  userPosition: { size: 0, avgPrice: 0 },
+  userPosition: {
+    size: 0,
+    avgPrice: 0,
+    canShort: true,
+    averageLongEntryPrice: 0,
+    averageShortEntryPrice: 0,
+    shortPositionSize: 0,
+    borrowInUse: 0,
+    reservedBorrow: 0,
+    equity: defaultConfig.userStartingBalance,
+    marginRatio: null,
+    leverage: 0,
+  },
   userOrders: [],
   userTradeHistory: [],
-  userPnl: { realized: 0, unrealized: 0 },
+  userPnl: {
+    realized: 0,
+    unrealized: 0,
+    realizedLong: 0,
+    realizedShort: 0,
+    unrealizedLong: 0,
+    unrealizedShort: 0,
+  },
   userEquityCurve: [],
+  shortSelling: createDefaultShortSellingState(defaultConfig),
 
   // --- Latency / event queue ---
   latencyEnabled: false,
@@ -102,35 +161,67 @@ export const useSimulationStore = create((set, get) => ({
   // --- Actions ---
 
   /** Bulk update from engine callback */
-  updateFromEngine: (data) => set({
-    tick: data.tick,
-    lastPrice: data.lastPrice,
-    bestBid: data.bestBid,
-    bestAsk: data.bestAsk,
-    spread: data.spread,
-    midPrice: data.midPrice,
-    bidLevels: data.bidLevels,
-    askLevels: data.askLevels,
-    cumulativeDepth: data.cumulativeDepth,
-    candles: data.candles,
-    currentCandle: data.currentCandle,
-    recentTrades: data.recentTrades,
-    volume: data.volume,
-    volatility: data.volatility,
-    orderFlowImbalance: data.orderFlowImbalance,
-    totalOrders: data.totalOrders,
-    totalBidVolume: data.totalBidVolume,
-    totalAskVolume: data.totalAskVolume,
-    makerStats: data.makerStats,
-    patterns: data.patterns,
-    history: data.history,
-    userOrders: data.userOrders,
-    isRunning: data.isRunning,
-    isPaused: data.isPaused,
-    latencyEnabled: data.latencyEnabled ?? false,
-    pendingEvents: data.pendingEvents ?? [],
-    pendingEventCount: data.pendingEventCount ?? 0,
-    eventLog: data.eventLog ?? [],
+  updateFromEngine: (data) => set((state) => {
+    const userPortfolio = data.userPortfolio ?? createDefaultUserPortfolio(state.config);
+    const nextEquityCurve = userPortfolio.equity != null
+      && state.userEquityCurve[state.userEquityCurve.length - 1]?.tick !== data.tick
+      ? [...state.userEquityCurve, { tick: data.tick, equity: userPortfolio.equity }]
+      : state.userEquityCurve;
+
+    return {
+      tick: data.tick,
+      lastPrice: data.lastPrice,
+      bestBid: data.bestBid,
+      bestAsk: data.bestAsk,
+      spread: data.spread,
+      midPrice: data.midPrice,
+      bidLevels: data.bidLevels,
+      askLevels: data.askLevels,
+      cumulativeDepth: data.cumulativeDepth,
+      candles: data.candles,
+      currentCandle: data.currentCandle,
+      recentTrades: data.recentTrades,
+      volume: data.volume,
+      volatility: data.volatility,
+      orderFlowImbalance: data.orderFlowImbalance,
+      totalOrders: data.totalOrders,
+      totalBidVolume: data.totalBidVolume,
+      totalAskVolume: data.totalAskVolume,
+      makerStats: data.makerStats,
+      patterns: data.patterns,
+      history: data.history,
+      userOrders: data.userOrders,
+      userBalance: userPortfolio.cash,
+      userPosition: {
+        size: userPortfolio.position,
+        avgPrice: userPortfolio.avgPrice,
+        canShort: userPortfolio.canShort,
+        averageLongEntryPrice: userPortfolio.averageLongEntryPrice,
+        averageShortEntryPrice: userPortfolio.averageShortEntryPrice,
+        shortPositionSize: userPortfolio.shortPositionSize,
+        borrowInUse: userPortfolio.borrowInUse,
+        reservedBorrow: userPortfolio.reservedBorrow,
+        equity: userPortfolio.equity,
+        marginRatio: userPortfolio.marginRatio,
+        leverage: userPortfolio.leverage,
+      },
+      userPnl: {
+        realized: userPortfolio.realizedPnL,
+        unrealized: userPortfolio.unrealizedPnL,
+        realizedLong: userPortfolio.realizedLongPnL,
+        realizedShort: userPortfolio.realizedShortPnL,
+        unrealizedLong: userPortfolio.unrealizedLongPnL,
+        unrealizedShort: userPortfolio.unrealizedShortPnL,
+      },
+      userEquityCurve: nextEquityCurve,
+      shortSelling: data.shortSelling ?? state.shortSelling,
+      isRunning: data.isRunning,
+      isPaused: data.isPaused,
+      latencyEnabled: data.latencyEnabled ?? false,
+      pendingEvents: data.pendingEvents ?? [],
+      pendingEventCount: data.pendingEventCount ?? 0,
+      eventLog: data.eventLog ?? [],
+    };
   }),
 
   setConfig: (updates) => set((state) => ({
@@ -146,62 +237,8 @@ export const useSimulationStore = create((set, get) => ({
 
   /** Record a user trade */
   recordUserTrade: (trade) => set((state) => {
-    const newHistory = [...state.userTradeHistory, trade];
-    const pos = { ...state.userPosition };
-    let balance = state.userBalance;
-    let realized = state.userPnl.realized;
-
-    if (trade.side === 'buy') {
-      const cost = trade.price * trade.size;
-      balance -= cost;
-      if (pos.size >= 0) {
-        // Adding to long
-        const totalCost = pos.avgPrice * pos.size + cost;
-        pos.size += trade.size;
-        pos.avgPrice = pos.size > 0 ? totalCost / pos.size : 0;
-      } else {
-        // Covering short
-        const pnl = (pos.avgPrice - trade.price) * Math.min(trade.size, Math.abs(pos.size));
-        realized += pnl;
-        balance += pnl;
-        pos.size += trade.size;
-        if (pos.size > 0) {
-          pos.avgPrice = trade.price;
-        }
-      }
-    } else {
-      const proceeds = trade.price * trade.size;
-      balance += proceeds;
-      if (pos.size <= 0) {
-        // Adding to short
-        const totalCost = Math.abs(pos.avgPrice * pos.size) + proceeds;
-        pos.size -= trade.size;
-        pos.avgPrice = pos.size !== 0 ? totalCost / Math.abs(pos.size) : 0;
-      } else {
-        // Selling long
-        const pnl = (trade.price - pos.avgPrice) * Math.min(trade.size, pos.size);
-        realized += pnl;
-        balance += pnl - proceeds;
-        pos.size -= trade.size;
-        if (pos.size < 0) {
-          pos.avgPrice = trade.price;
-        }
-      }
-    }
-
-    const unrealized = pos.size !== 0
-      ? (state.lastPrice - pos.avgPrice) * pos.size
-      : 0;
-
-    const equity = balance + unrealized + Math.abs(pos.size) * state.lastPrice;
-    const equityCurve = [...state.userEquityCurve, { tick: state.tick, equity }];
-
     return {
-      userBalance: balance,
-      userPosition: pos,
-      userTradeHistory: newHistory,
-      userPnl: { realized, unrealized },
-      userEquityCurve: equityCurve,
+      userTradeHistory: [...state.userTradeHistory, trade],
     };
   }),
 
@@ -214,19 +251,35 @@ export const useSimulationStore = create((set, get) => ({
   })),
 
   /** Update unrealized PnL based on current price */
-  updateUnrealizedPnl: () => set((state) => {
-    const { size, avgPrice } = state.userPosition;
-    const unrealized = size !== 0 ? (state.lastPrice - avgPrice) * size : 0;
-    return { userPnl: { ...state.userPnl, unrealized } };
-  }),
+  updateUnrealizedPnl: () => set((state) => state),
 
   /** Reset user trading state */
   resetUser: () => set({
     userBalance: defaultConfig.userStartingBalance,
-    userPosition: { size: 0, avgPrice: 0 },
+    userPosition: {
+      size: 0,
+      avgPrice: 0,
+      canShort: true,
+      averageLongEntryPrice: 0,
+      averageShortEntryPrice: 0,
+      shortPositionSize: 0,
+      borrowInUse: 0,
+      reservedBorrow: 0,
+      equity: defaultConfig.userStartingBalance,
+      marginRatio: null,
+      leverage: 0,
+    },
     userOrders: [],
     userTradeHistory: [],
-    userPnl: { realized: 0, unrealized: 0 },
+    userPnl: {
+      realized: 0,
+      unrealized: 0,
+      realizedLong: 0,
+      realizedShort: 0,
+      unrealizedLong: 0,
+      unrealizedShort: 0,
+    },
     userEquityCurve: [],
+    shortSelling: createDefaultShortSellingState(defaultConfig),
   }),
 }));

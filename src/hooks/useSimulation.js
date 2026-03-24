@@ -24,6 +24,7 @@ function processUserFills(store, data) {
         size: fill.trades[0].size,
         tick: fill.trades[0].tick,
         timestamp: fill.trades[0].timestamp,
+        isForcedCover: !!fill.isForcedCover,
       });
     } else {
       // Our order arrived (possibly after delay) and matched
@@ -44,6 +45,7 @@ function processUserFills(store, data) {
           impactSlippageBps: summary.quoteSlippageBps,
           levelsSwept: summary.levelsSwept,
           quoteFadeVolume: summary.quoteFadeVolume,
+          isForcedCover: !!fill.isForcedCover,
         });
       } else {
         for (const trade of trades) {
@@ -53,6 +55,7 @@ function processUserFills(store, data) {
             size: trade.size,
             tick: trade.tick,
             timestamp: trade.timestamp,
+            isForcedCover: !!fill.isForcedCover,
           });
         }
       }
@@ -64,7 +67,6 @@ function createEngineCallback(store) {
   return (data) => {
     store.getState().updateFromEngine(data);
     processUserFills(store, data);
-    store.getState().updateUnrealizedPnl();
   };
 }
 
@@ -143,35 +145,7 @@ export function useSimulation() {
       // Schedule through the event queue — fills arrive via callback later
       engine.scheduleUserOrder(order);
     } else {
-      // Direct execution — record fills immediately
-      const { trades, summary } = engine.processUserOrder(order);
-      if (type === 'market' && summary?.filledSize > 0) {
-        store.getState().recordUserTrade({
-          side,
-          price: summary.averageFillPrice,
-          size: summary.filledSize,
-          tick: summary.tick ?? state.tick,
-          timestamp: summary.timestamp,
-          arrivalPrice: summary.arrivalPrice,
-          referencePrice: summary.referencePrice,
-          slippage: summary.totalSlippage,
-          slippageBps: summary.totalSlippageBps,
-          impactSlippage: summary.quoteSlippage,
-          impactSlippageBps: summary.quoteSlippageBps,
-          levelsSwept: summary.levelsSwept,
-          quoteFadeVolume: summary.quoteFadeVolume,
-        });
-      } else {
-        for (const trade of trades) {
-          store.getState().recordUserTrade({
-            side,
-            price: trade.price,
-            size: trade.size,
-            tick: trade.tick,
-            timestamp: trade.timestamp,
-          });
-        }
-      }
+      engine.processUserOrder(order);
     }
   }, [store]);
 

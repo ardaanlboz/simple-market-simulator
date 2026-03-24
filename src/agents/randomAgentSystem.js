@@ -39,19 +39,28 @@ export class RandomAgentSystem {
     const n = this.config.numAgents ?? 100;
 
     for (let i = 0; i < n; i++) {
+      const buyBias = clamp(this.rng.float(
+        this.config.buyBias - 0.2,
+        this.config.buyBias + 0.2
+      ), 0.1, 0.9);
+      const sizeScale = this.rng.logNormal(0, 0.5);
+      const startingPortfolioValue = this._sampleStartingPortfolioValue(sizeScale);
+      const startingInventory = this._sampleStartingInventory(startingPortfolioValue, buyBias);
+      const startingCash = this._sampleStartingCash(startingPortfolioValue, startingInventory);
+
       this.agents.push({
         id: `agent-${i}`,
+        canShort: this.rng.bool(this.config.shortEnabledAgentRatio ?? 0.35),
+        startingInventory,
+        startingCash,
         // Core personality — set once at creation
         activityRate: this.rng.float(0.005, 0.15),
-        buyBias: clamp(this.rng.float(
-          this.config.buyBias - 0.2,
-          this.config.buyBias + 0.2
-        ), 0.1, 0.9),
+        buyBias,
         limitBias: this.rng.float(
           Math.max(0.5, this.config.limitBias - 0.15),
           Math.min(0.98, this.config.limitBias + 0.1)
         ),
-        sizeScale: this.rng.logNormal(0, 0.5),
+        sizeScale,
         priceSpread: this.rng.float(0.5, 3.0),
         lifetimeScale: this.rng.logNormal(0, 0.35),
         cancelRate: this.rng.float(0.002, 0.03),
@@ -140,6 +149,56 @@ export class RandomAgentSystem {
     );
   }
 
+  _sampleStartingPortfolioValue(sizeScale) {
+    const referencePrice = Math.max(1, this.config.initialPrice);
+    const referenceSize = Math.max(1, this.config.baseOrderSize);
+    const scaledMultiplier = clamp(
+      this.rng.float(10, 26) * Math.max(0.65, Math.sqrt(sizeScale)),
+      8,
+      42
+    );
+
+    return referencePrice * referenceSize * scaledMultiplier;
+  }
+
+  _sampleStartingInventory(portfolioValue, buyBias) {
+    const referencePrice = Math.max(1, this.config.initialPrice);
+    const inventoryWeight = clamp(
+      0.52 + (0.5 - buyBias) * 0.85 + this.rng.gaussian(0, 0.08),
+      0.18,
+      0.82
+    );
+    const minimumInventory = Math.max(1, Math.round((this.config.baseOrderSize ?? 10) * 1.5));
+
+    return Math.max(
+      minimumInventory,
+      Math.round((portfolioValue * inventoryWeight) / referencePrice)
+    );
+  }
+
+  _sampleStartingCash(portfolioValue, startingInventory) {
+    const referencePrice = Math.max(1, this.config.initialPrice);
+    const liquidityReserve = referencePrice * Math.max(4, this.config.baseOrderSize ?? 10) * 10;
+    const inventoryNotional = startingInventory * referencePrice;
+
+    return Math.max(
+      liquidityReserve,
+      portfolioValue * this.rng.float(0.35, 0.75) + inventoryNotional * this.rng.float(0.15, 0.4)
+    );
+  }
+
+  _getInventoryPressure(agent, portfolioManager, midPrice) {
+    if (!portfolioManager) return 0;
+
+    const account = portfolioManager.getAccount(agent.id);
+    if (!account) return 0;
+
+    const equity = account.cash + account.position * midPrice;
+    if (!Number.isFinite(equity) || Math.abs(equity) < 1e-6) return 0;
+
+    return clamp((account.position * midPrice) / equity, -1.5, 1.5);
+  }
+
   _sampleLimitPrice(agent, isBuy, midPrice, orderBook, urgency) {
     const state = this.marketState;
     const tickSize = orderBook.tickSize;
@@ -183,7 +242,7 @@ export class RandomAgentSystem {
    * (not executed directly) so the simulation loop can route them
    * through the latency event queue.
    */
-  tick(currentTick, midPrice, orderBook) {
+  tick(currentTick, midPrice, orderBook, portfolioManager = null) {
     const orders = [];
     const cancels = [];
 
@@ -218,8 +277,12 @@ export class RandomAgentSystem {
 
       // Decide buy or sell
       const effectiveBuyBias = clamp(
-        (agent.buyBias + state.flowBias * 0.18 + this.rng.gaussian(0, 0.015))
-          * this.config.buyProbability / 0.5,
+        (
+          agent.buyBias
+          + state.flowBias * 0.18
+          + this.rng.gaussian(0, 0.015)
+          - this._getInventoryPressure(agent, portfolioManager, midPrice) * 0.18
+        ) * this.config.buyProbability / 0.5,
         0.02,
         0.98
       );
@@ -278,9 +341,16 @@ export class RandomAgentSystem {
   /** Reconfigure agents (e.g., when user changes params) */
   updateConfig(newConfig) {
     const previousAgentCount = this.config.numAgents;
+    const previousShortEnabledRatio = this.config.shortEnabledAgentRatio;
     this.config = { ...this.config, ...newConfig };
 
-    if (newConfig.numAgents != null && newConfig.numAgents !== previousAgentCount) {
+    if (
+      (newConfig.numAgents != null && newConfig.numAgents !== previousAgentCount)
+      || (
+        newConfig.shortEnabledAgentRatio != null
+        && newConfig.shortEnabledAgentRatio !== previousShortEnabledRatio
+      )
+    ) {
       this.initAgents();
     }
   }

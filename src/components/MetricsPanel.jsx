@@ -12,6 +12,7 @@ export default function MetricsPanel() {
   const totalBidVolume = useSimulationStore((s) => s.totalBidVolume);
   const totalAskVolume = useSimulationStore((s) => s.totalAskVolume);
   const makerStats = useSimulationStore((s) => s.makerStats);
+  const shortSelling = useSimulationStore((s) => s.shortSelling);
   const patterns = useSimulationStore((s) => s.patterns);
   const config = useSimulationStore((s) => s.config);
 
@@ -38,6 +39,33 @@ export default function MetricsPanel() {
         <Metric label="Book Orders" value={totalOrders.toLocaleString()} />
         <Metric label="Bid Volume" value={formatSize(totalBidVolume)} color="#22c55e" />
         <Metric label="Ask Volume" value={formatSize(totalAskVolume)} color="#ef4444" />
+      </div>
+
+      <div className="flex flex-col gap-1 shrink-0">
+        <div className="text-gray-400 font-bold mb-1">Short Selling</div>
+        <Metric
+          label="Status"
+          value={shortSelling.enabled ? 'Enabled' : 'Disabled'}
+          color={shortSelling.enabled ? '#f97316' : '#9ca3af'}
+        />
+        <Metric
+          label="Borrow"
+          value={shortSelling.borrowAvailable ? 'Available' : 'Off'}
+          color={shortSelling.borrowAvailable ? '#22c55e' : '#ef4444'}
+        />
+        <Metric
+          label="Pool"
+          value={`${formatSize(shortSelling.borrowPoolRemaining)} / ${formatSize(shortSelling.borrowPoolSize)}`}
+        />
+        <Metric
+          label="Used / Reserved"
+          value={`${formatSize(shortSelling.activeBorrow)} / ${formatSize(shortSelling.reservedBorrow)}`}
+        />
+        <Metric
+          label="Short Agents"
+          value={`${shortSelling.activeShortCount} active / ${shortSelling.shortEnabledAgentCount} enabled`}
+        />
+        <Metric label="Forced Covers" value={shortSelling.forcedCoverCount.toLocaleString()} />
       </div>
 
       {config.enableMarketMakers && (

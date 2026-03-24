@@ -16,6 +16,7 @@ export default function ManualTrading({ sim }) {
   const userPnl = useSimulationStore((s) => s.userPnl);
   const userOrders = useSimulationStore((s) => s.userOrders);
   const userTradeHistory = useSimulationStore((s) => s.userTradeHistory);
+  const shortSelling = useSimulationStore((s) => s.shortSelling);
   const latencyEnabled = useSimulationStore((s) => s.latencyEnabled);
   const pendingEvents = useSimulationStore((s) => s.pendingEvents);
   const pendingEventCount = useSimulationStore((s) => s.pendingEventCount);
@@ -41,8 +42,7 @@ export default function ManualTrading({ sim }) {
   );
   const pendingCancelOrderIds = new Set(pendingUserCancels.map((e) => e.orderId));
 
-  const equity = userBalance + userPnl.unrealized +
-    Math.abs(userPosition.size) * (userPosition.size > 0 ? lastPrice : -lastPrice + 2 * userPosition.avgPrice);
+  const equity = userPosition.equity ?? (userBalance + userPosition.size * lastPrice);
 
   return (
     <div className="flex gap-4 h-full text-xs">
@@ -121,6 +121,11 @@ export default function ManualTrading({ sim }) {
             )}
           </div>
         )}
+
+        <div className="text-[10px] text-gray-500 mt-1 px-1">
+          Shorting {shortSelling.enabled ? 'enabled' : 'disabled'}
+          {' '}• Borrow {shortSelling.borrowAvailable ? 'available' : 'off'}
+        </div>
       </form>
 
       {/* Position & PnL */}
@@ -137,8 +142,32 @@ export default function ManualTrading({ sim }) {
           <span className="text-gray-300">{formatPrice(userPosition.avgPrice)}</span>
         </div>
         <div className="flex justify-between">
+          <span className="text-gray-500">Can Short:</span>
+          <span className={userPosition.canShort ? 'text-green-400' : 'text-gray-400'}>
+            {userPosition.canShort ? 'Yes' : 'No'}
+          </span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-gray-500">Short Size:</span>
+          <span className={userPosition.shortPositionSize > 0 ? 'text-red-400' : 'text-gray-300'}>
+            {userPosition.shortPositionSize}
+          </span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-gray-500">Short Avg:</span>
+          <span className="text-gray-300">{formatPrice(userPosition.averageShortEntryPrice)}</span>
+        </div>
+        <div className="flex justify-between">
           <span className="text-gray-500">Balance:</span>
           <span className="text-gray-300">{formatPrice(userBalance)}</span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-gray-500">Equity:</span>
+          <span className="text-gray-300">{formatPrice(equity)}</span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-gray-500">Borrow Used:</span>
+          <span className="text-gray-300">{userPosition.borrowInUse}</span>
         </div>
         <div className="flex justify-between">
           <span className="text-gray-500">Realized:</span>
@@ -150,6 +179,18 @@ export default function ManualTrading({ sim }) {
           <span className="text-gray-500">Unrealized:</span>
           <span className={userPnl.unrealized >= 0 ? 'text-green-400' : 'text-red-400'}>
             {formatPnl(userPnl.unrealized)}
+          </span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-gray-500">Short Realized:</span>
+          <span className={userPnl.realizedShort >= 0 ? 'text-green-400' : 'text-red-400'}>
+            {formatPnl(userPnl.realizedShort)}
+          </span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-gray-500">Short Unreal.:</span>
+          <span className={userPnl.unrealizedShort >= 0 ? 'text-green-400' : 'text-red-400'}>
+            {formatPnl(userPnl.unrealizedShort)}
           </span>
         </div>
       </div>
@@ -213,6 +254,11 @@ export default function ManualTrading({ sim }) {
                 <div className="text-[10px] text-gray-500 mt-0.5">
                   Qty {order.quantity} • Filled {order.filledQuantity} • Remaining {order.remainingQuantity}
                 </div>
+                {order.reservedShortQuantity > 0 && (
+                  <div className="text-[10px] text-amber-400/70 mt-0.5">
+                    Borrow reserved: {order.reservedShortQuantity}
+                  </div>
+                )}
                 {order.queuePosition != null && order.priceLevelOrderCount != null && (
                   <div className="text-[10px] text-gray-500 mt-0.5">
                     Queue {order.queuePosition}/{order.priceLevelOrderCount} @ {formatPrice(order.levelPrice ?? order.price)}
@@ -241,6 +287,11 @@ export default function ManualTrading({ sim }) {
                 </span>
                 <span className="text-gray-300">{formatPrice(t.price)}</span>
                 <span className="text-gray-500">x{t.size}</span>
+                {t.isForcedCover && (
+                  <span className="text-amber-400 text-[10px] uppercase tracking-wide">
+                    forced
+                  </span>
+                )}
               </div>
               {t.slippageBps != null && (
                 <div className="text-[10px] text-gray-500 mt-0.5">

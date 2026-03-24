@@ -70,6 +70,18 @@ export const defaultConfig = {
 
   // Manual trading
   userStartingBalance: 10000,
+
+  // Short selling
+  shortSellingEnabled: true,
+  borrowAvailable: true,
+  borrowPoolSize: 3000,
+  maxShortPositionPerAgent: 100,
+  marginRequirement: 0.5,
+  maxLeverage: 3.0,
+  shortEnabledAgentRatio: 0.35,
+  enableForcedCover: false,
+  maintenanceMarginThreshold: 0.25,
+  shortLiquidationBuffer: 0.1,
 };
 
 /**
@@ -128,4 +140,10 @@ export const marketMakerConfigRanges = {
   makerReactionDelay: { min: 1, max: 120, step: 1, label: "Reaction Delay" },
   probabilityOfJoiningBestBidAsk: { min: 0, max: 1, step: 0.05, label: "Join Best Prob." },
   probabilityOfQuotingOneTickAway: { min: 0, max: 1, step: 0.05, label: "One Tick Away Prob." },
+};
+
+export const shortSellingConfigRanges = {
+  borrowPoolSize: { min: 0, max: 10000, step: 50, label: 'Borrow Pool Size' },
+  maxShortPositionPerAgent: { min: 0, max: 1000, step: 5, label: 'Max Short / Agent' },
+  maintenanceMarginThreshold: { min: 0.05, max: 1.0, step: 0.05, label: 'Maintenance Margin' },
 };

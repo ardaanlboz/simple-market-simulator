@@ -18,7 +18,12 @@
  * 7. Display state is pushed to callback
  */
 
-import { OrderBook, resetOrderIdCounter } from './orderBook.js';
+import {
+  createOrder,
+  normalizeOrderFields,
+  OrderBook,
+  resetOrderIdCounter,
+} from './orderBook.js';
 import { MatchingEngine } from './matchingEngine.js';
 import { MetricsEngine } from './metricsEngine.js';
 import { PatternDetector } from './patternDetector.js';
@@ -26,6 +31,7 @@ import { RandomAgentSystem } from '../agents/randomAgentSystem.js';
 import { MarketMakerSystem } from '../agents/marketMakerSystem.js';
 import { SeededRng } from './seededRng.js';
 import { EventQueue, EVENT_TYPES, sampleLatency } from './eventQueue.js';
+import { PortfolioManager } from './portfolioManager.js';
 
 function sampleOffset(rng, tickSize, meanTicks) {
   const lambda = 1 / Math.max(1, meanTicks);
@@ -58,6 +64,7 @@ export class SimulationLoop {
     this.patternDetector = new PatternDetector(config);
     this.agentSystem = new RandomAgentSystem(this.rng, config);
     this.marketMakerSystem = new MarketMakerSystem(this.marketMakerRng, config);
+    this.portfolioManager = new PortfolioManager(config);
     this.eventQueue = new EventQueue();
 
     this.tick = 0;
@@ -75,6 +82,8 @@ export class SimulationLoop {
     // History for replay
     this.history = [];
     this.maxHistoryLength = 50000;
+
+    this._registerManagedAgents();
 
     // Seed the order book with initial liquidity
     this._seedInitialLiquidity();
@@ -170,9 +179,11 @@ export class SimulationLoop {
     this.patternDetector = new PatternDetector(this.config);
     this.agentSystem = new RandomAgentSystem(this.rng, this.config);
     this.marketMakerSystem = new MarketMakerSystem(this.marketMakerRng, this.config);
+    this.portfolioManager = new PortfolioManager(this.config);
     this.eventQueue.reset();
     this._pendingUserFills = [];
     this.history = [];
+    this._registerManagedAgents();
     this._seedInitialLiquidity();
     this._pushUpdate();
   }
@@ -189,11 +200,15 @@ export class SimulationLoop {
   /** Update config */
   updateConfig(newConfig) {
     const wasLatencyEnabled = !!this.config.enableLatency;
+    const shortConfigChanged = this._didShortConfigChange(newConfig);
+    const shouldCancelShortDependentOrders = this._shouldCancelShortDependentOrders(newConfig);
     this.config = { ...this.config, ...newConfig };
     this.agentSystem.updateConfig(this.config);
     this.marketMakerSystem.updateConfig(newConfig, this.orderBook, this.tick);
     this.matchingEngine.updateConfig(this.config);
     this.metricsEngine.updateConfig(this.config);
+    this.portfolioManager.updateConfig(this.config);
+    this._registerManagedAgents();
 
     if (this.isRunning && !this.isPaused && newConfig.tickInterval != null) {
       this._scheduleLoop();
@@ -202,6 +217,10 @@ export class SimulationLoop {
     // If latency was just disabled, flush all pending events immediately
     if (wasLatencyEnabled && newConfig.enableLatency === false) {
       this._flushEventQueue();
+    }
+
+    if (shouldCancelShortDependentOrders) {
+      this._cancelShortDependentOrders();
     }
 
     if (
@@ -218,6 +237,7 @@ export class SimulationLoop {
       || newConfig.probabilityOfQuotingOneTickAway != null
       || newConfig.quoteSizeRange != null
       || newConfig.enableLatency != null
+      || shortConfigChanged
     ) {
       this._pushUpdate();
     }
@@ -260,6 +280,251 @@ export class SimulationLoop {
     return Date.now();
   }
 
+  _agentStartingCash() {
+    return Math.max(
+      this.config.userStartingBalance ?? 10000,
+      (this.config.initialPrice ?? 100) * Math.max(10, this.config.baseOrderSize ?? 10) * 10
+    );
+  }
+
+  _makerStartingCash() {
+    return Math.max(
+      this._agentStartingCash() * 5,
+      (this.config.initialPrice ?? 100) * Math.max(50, this.config.maxInventory ?? 150) * 4
+    );
+  }
+
+  _registerManagedAgents() {
+    this.portfolioManager.registerAgent({
+      id: 'user',
+      canShort: true,
+      startingCash: this.config.userStartingBalance ?? 10000,
+    });
+
+    for (const agent of this.agentSystem.agents) {
+      this.portfolioManager.registerAgent({
+        id: agent.id,
+        canShort: agent.canShort,
+        startingCash: agent.startingCash ?? this._agentStartingCash(),
+        startingPosition: agent.startingInventory ?? 0,
+        startingEntryPrice: this.config.initialPrice,
+      });
+    }
+
+    for (const maker of this.marketMakerSystem.makers) {
+      this.portfolioManager.registerAgent({
+        id: maker.id,
+        canShort: true,
+        startingCash: this._makerStartingCash(),
+        maxShortPositionOverride: this.config.maxInventory,
+      });
+    }
+  }
+
+  _didShortConfigChange(newConfig) {
+    return [
+      'shortSellingEnabled',
+      'borrowAvailable',
+      'borrowPoolSize',
+      'maxShortPositionPerAgent',
+      'marginRequirement',
+      'maxLeverage',
+      'enableForcedCover',
+      'maintenanceMarginThreshold',
+      'shortLiquidationBuffer',
+      'shortEnabledAgentRatio',
+    ].some((key) => Object.prototype.hasOwnProperty.call(newConfig, key));
+  }
+
+  _shouldCancelShortDependentOrders(newConfig) {
+    if (newConfig.shortSellingEnabled === false || newConfig.borrowAvailable === false) {
+      return true;
+    }
+
+    if (
+      newConfig.maxShortPositionPerAgent != null
+      && newConfig.maxShortPositionPerAgent < (this.config.maxShortPositionPerAgent ?? Number.POSITIVE_INFINITY)
+    ) {
+      return true;
+    }
+
+    if (
+      newConfig.borrowPoolSize != null
+      && newConfig.borrowPoolSize < (this.config.borrowPoolSize ?? Number.POSITIVE_INFINITY)
+    ) {
+      return true;
+    }
+
+    if (
+      newConfig.marginRequirement != null
+      && newConfig.marginRequirement > (this.config.marginRequirement ?? 0)
+    ) {
+      return true;
+    }
+
+    if (
+      newConfig.maxLeverage != null
+      && newConfig.maxLeverage < (this.config.maxLeverage ?? Number.POSITIVE_INFINITY)
+    ) {
+      return true;
+    }
+
+    return false;
+  }
+
+  _currentMarkPrice() {
+    return this.orderBook.midPrice || this.lastPrice || this.config.initialPrice;
+  }
+
+  _applyValidationToOrder(order, validation) {
+    normalizeOrderFields(order);
+    order.requestedQuantity = validation.requestedQuantity;
+    order.rejectedQuantity = validation.rejectedQuantity;
+    order.validation = validation;
+
+    if (validation.acceptedQuantity === order.quantity) {
+      return order;
+    }
+
+    order.quantity = validation.acceptedQuantity;
+    order.size = validation.acceptedQuantity;
+    order.filledQuantity = 0;
+    order.remainingQuantity = validation.acceptedQuantity;
+    order.remainingSize = validation.acceptedQuantity;
+    normalizeOrderFields(order);
+
+    return order;
+  }
+
+  _recordPendingUserFill(order, result, snapshot = null) {
+    if (order.agentId !== 'user' || result.trades.length === 0) return;
+
+    this._pendingUserFills.push({
+      order,
+      trades: result.trades,
+      summary: result.summary,
+      snapshot,
+      isForcedCover: !!order.isForcedCover,
+    });
+  }
+
+  _processIncomingOrder(order, snapshot = null) {
+    normalizeOrderFields(order);
+    const validation = this.portfolioManager.validateOrder(
+      order,
+      this.orderBook,
+      this._getExecutionContext()
+    );
+
+    if (validation.acceptedQuantity <= 0) {
+      return {
+        trades: [],
+        rested: false,
+        summary: null,
+        validation,
+        rejected: true,
+      };
+    }
+
+    this._applyValidationToOrder(order, validation);
+
+    const result = this.matchingEngine.processOrder(
+      order,
+      this.tick,
+      this._getExecutionContext()
+    );
+
+    const markPrice = result.trades.at(-1)?.price ?? this._currentMarkPrice();
+    this.portfolioManager.applyTrades(result.trades, this.orderBook, markPrice);
+    this.portfolioManager.rebalanceBorrowReservations(order.agentId, this.orderBook);
+    this._recordPendingUserFill(order, result, snapshot);
+
+    return {
+      ...result,
+      validation,
+      rejected: false,
+    };
+  }
+
+  _rebalanceAfterOrderRemoval(order) {
+    if (!order?.agentId) return;
+    this.portfolioManager.rebalanceBorrowReservations(order.agentId, this.orderBook);
+  }
+
+  _cancelShortDependentOrders() {
+    const touchedAgents = new Set();
+
+    for (const order of this.portfolioManager.getShortDependentSellOrders(this.orderBook)) {
+      const cancelled = this.orderBook.cancelOrder(order.id);
+      if (cancelled?.agentId) {
+        touchedAgents.add(cancelled.agentId);
+      }
+    }
+
+    for (const agentId of touchedAgents) {
+      this.portfolioManager.rebalanceBorrowReservations(agentId, this.orderBook);
+    }
+  }
+
+  _cancelAgentSellOrders(agentId) {
+    if (!agentId) return;
+
+    const orderIds = this.orderBook.getAgentOrderIds(agentId);
+    let didCancel = false;
+
+    for (const orderId of orderIds) {
+      const order = this.orderBook.getOrder(orderId);
+      if (!order || order.side !== 'sell') continue;
+      this.orderBook.cancelOrder(orderId);
+      didCancel = true;
+    }
+
+    if (didCancel) {
+      this.portfolioManager.rebalanceBorrowReservations(agentId, this.orderBook);
+    }
+  }
+
+  _runForcedCovers(allTrades) {
+    if (!this.config.enableForcedCover) return;
+
+    let guard = 0;
+    while (guard < 50) {
+      guard++;
+
+      const candidate = this.portfolioManager
+        .getAccounts()
+        .map((account) => this.portfolioManager.maybeForceCover(account, this._currentMarkPrice()))
+        .filter(Boolean)
+        .sort((a, b) => (
+          (a.marginRatio - b.marginRatio)
+          || (b.coverSize - a.coverSize)
+          || String(a.agentId).localeCompare(String(b.agentId))
+        ))[0];
+
+      if (!candidate || candidate.coverSize <= 0) break;
+
+      this._cancelAgentSellOrders(candidate.agentId);
+
+      const coverOrder = createOrder({
+        side: 'buy',
+        type: 'market',
+        size: candidate.coverSize,
+        agentId: candidate.agentId,
+        tick: this.tick,
+      });
+      coverOrder.isForcedCover = true;
+      coverOrder.forcedCoverMarginRatio = candidate.marginRatio;
+
+      const result = this._processIncomingOrder(coverOrder);
+      if (result.trades.length === 0) {
+        break;
+      }
+
+      this.portfolioManager.recordForcedCover(this.tick);
+      allTrades.push(...result.trades);
+    }
+  }
+
   // ---------------------------------------------------------------------------
   //  Core tick processing
   // ---------------------------------------------------------------------------
@@ -270,7 +535,10 @@ export class SimulationLoop {
     this._pendingUserFills = [];
 
     // 1. Remove expired orders
-    this.orderBook.removeExpired(this.tick);
+    const expiredOrders = this.orderBook.removeExpired(this.tick);
+    for (const order of expiredOrders) {
+      this._rebalanceAfterOrderRemoval(order);
+    }
 
     if (this.config.enableLatency) {
       this._processTickWithLatency();
@@ -287,26 +555,29 @@ export class SimulationLoop {
       this._getExecutionContext(),
       this.orderBook
     );
-    const agentResult = this.agentSystem.tick(this.tick, midPrice, this.orderBook);
+    const agentResult = this.agentSystem.tick(
+      this.tick,
+      midPrice,
+      this.orderBook,
+      this.portfolioManager
+    );
     const agentOrders = agentResult.orders ?? agentResult;
     const agentCancels = agentResult.cancels ?? [];
 
     // Execute agent cancels directly
     for (const cancel of agentCancels) {
-      this.orderBook.cancelOrder(cancel.orderId);
+      const cancelled = this.orderBook.cancelOrder(cancel.orderId);
+      this._rebalanceAfterOrderRemoval(cancelled);
     }
 
     // Process each order through matching engine
     const allTrades = [];
     for (const order of [...makerOrders, ...agentOrders]) {
-      const { trades } = this.matchingEngine.processOrder(
-        order,
-        this.tick,
-        this._getExecutionContext()
-      );
+      const { trades } = this._processIncomingOrder(order);
       allTrades.push(...trades);
     }
 
+    this._runForcedCovers(allTrades);
     this._collectUserFills(allTrades);
     this._finalizeTick(allTrades);
   }
@@ -338,7 +609,12 @@ export class SimulationLoop {
       this._getExecutionContext(),
       this.orderBook
     );
-    const agentResult = this.agentSystem.tick(this.tick, midPrice, this.orderBook);
+    const agentResult = this.agentSystem.tick(
+      this.tick,
+      midPrice,
+      this.orderBook,
+      this.portfolioManager
+    );
     const agentOrders = agentResult.orders ?? agentResult;
     const agentCancels = agentResult.cancels ?? [];
 
@@ -408,6 +684,7 @@ export class SimulationLoop {
       }
     }
 
+    this._runForcedCovers(allTrades);
     this._collectUserFills(allTrades);
     this._finalizeTick(allTrades);
   }
@@ -423,7 +700,8 @@ export class SimulationLoop {
     if (order) {
       order.cancelRequestedAt = event.createdAt;
       order.cancelledAt = this.tick;
-      this.orderBook.cancelOrder(orderId);
+      const cancelled = this.orderBook.cancelOrder(orderId);
+      this._rebalanceAfterOrderRemoval(cancelled);
       event.result = 'cancelled';
     } else {
       // Order may already be filled or expired — or still pending submission
@@ -438,21 +716,19 @@ export class SimulationLoop {
     order.submittedAt = event.createdAt;
     order.enteredBookAt = this.tick;
 
-    const result = this.matchingEngine.processOrder(
-      order,
-      this.tick,
-      this._getExecutionContext()
-    );
-    const { trades, summary } = result;
+    const result = this._processIncomingOrder(order, event.snapshot);
+    const { trades, validation } = result;
 
-    // Capture user fills for the UI callback
-    if (order.agentId === 'user' && trades.length > 0) {
-      this._pendingUserFills.push({
-        order,
-        trades,
-        summary,
-        snapshot: event.snapshot,
-      });
+    if (result.rejected) {
+      event.result = validation.reason ?? 'rejected';
+      return trades;
+    }
+
+    if (validation.wasAdjusted) {
+      event.result = trades.length > 0
+        ? `filled_${trades.length}_partial_accept`
+        : 'rested_partial_accept';
+      return trades;
     }
 
     event.result = trades.length > 0 ? `filled_${trades.length}` : 'rested';
@@ -468,6 +744,7 @@ export class SimulationLoop {
       this.lastPrice = allTrades[allTrades.length - 1].price;
     }
 
+    this.portfolioManager.markAllToMarket(this._currentMarkPrice());
     this.metricsEngine.processTick(this.tick, allTrades, this.orderBook, this.lastPrice);
     this.marketMakerSystem.handleFills(allTrades, this.tick);
 
@@ -580,24 +857,27 @@ export class SimulationLoop {
 
   /** Process a user-submitted order immediately (no latency) */
   processUserOrder(order) {
-    const result = this.matchingEngine.processOrder(
-      order,
-      this.tick,
-      this._getExecutionContext()
-    );
-    const { trades } = result;
+    this._pendingUserFills = [];
+    const result = this._processIncomingOrder(order);
+    const trades = [...result.trades];
+    this._runForcedCovers(trades);
     if (trades.length > 0) {
       this.lastPrice = trades[trades.length - 1].price;
       this.metricsEngine.processTrades(this.tick, trades);
       this.marketMakerSystem.handleFills(trades, this.tick);
     }
     this._pushUpdate();
-    return result;
+    return {
+      ...result,
+      trades,
+    };
   }
 
   /** Cancel a user order immediately (no latency) */
   cancelUserOrder(orderId) {
+    this._pendingUserFills = [];
     const cancelled = this.orderBook.cancelOrder(orderId);
+    this._rebalanceAfterOrderRemoval(cancelled);
     this._pushUpdate();
     return cancelled;
   }
@@ -629,6 +909,8 @@ export class SimulationLoop {
         trades.push(...this._executeSubmitEvent(event));
       }
     }
+
+    this._runForcedCovers(trades);
 
     if (trades.length > 0) {
       this.lastPrice = trades[trades.length - 1].price;
@@ -669,6 +951,7 @@ export class SimulationLoop {
     const depth = this.orderBook.getDepth(25);
     const cumulativeDepth = this.orderBook.getCumulativeDepth(50);
     const latencyEnabled = !!this.config.enableLatency;
+    const markPrice = this._currentMarkPrice();
 
     this.onUpdate({
       tick: this.tick,
@@ -693,6 +976,8 @@ export class SimulationLoop {
       patterns: this.patternDetector.getPatterns(),
       history: this.history,
       userOrders: this._getUserOrdersSnapshot(),
+      userPortfolio: this.portfolioManager.getAccountSnapshot('user', markPrice),
+      shortSelling: this.portfolioManager.getShortSellingSnapshot(markPrice),
       isRunning: this.isRunning,
       isPaused: this.isPaused,
 
@@ -719,6 +1004,7 @@ export class SimulationLoop {
         const queue = this.orderBook.getQueuePosition(order.id);
         return {
           ...order,
+          reservedShortQuantity: order.reservedShortQuantity ?? 0,
           queuePosition: queue?.position ?? null,
           priceLevelOrderCount: queue?.levelOrderCount ?? null,
           levelPrice: queue?.levelPrice ?? order.price ?? null,
