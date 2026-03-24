@@ -3,6 +3,10 @@ import { createOrder } from '../engine/orderBook.js';
 const MIN_REVIEW_INTERVAL = 5;
 const REFRESH_JITTER_RATIO = 0.35;
 const MISSED_REFRESH_PROBABILITY = 0.14;
+const LAST_PRICE_WEIGHT = 0.7;
+const MID_PRICE_WEIGHT = 0.3;
+const INVENTORY_SKEW_SCALE = 0.25;
+const MAX_JOIN_BOTH_SIDES_PROBABILITY = 0.08;
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
@@ -419,28 +423,47 @@ export class MarketMakerSystem {
 
   _buildQuotePlan(maker, marketState, orderBook, sampleSizes) {
     const tickSize = orderBook.tickSize;
-    const referencePrice = marketState.midPrice || marketState.lastPrice || this.config.initialPrice;
-    const bestBid = orderBook.bestBid ?? (referencePrice - tickSize);
-    const bestAsk = orderBook.bestAsk ?? (referencePrice + tickSize);
+    const lastPrice = marketState.lastPrice || marketState.midPrice || this.config.initialPrice;
+    const midPrice = marketState.midPrice || lastPrice;
+    const fairPrice = lastPrice * LAST_PRICE_WEIGHT + midPrice * MID_PRICE_WEIGHT;
+    const bestBid = orderBook.bestBid ?? (fairPrice - tickSize);
+    const bestAsk = orderBook.bestAsk ?? (fairPrice + tickSize);
     const maxInventory = Math.max(1, this.config.maxInventory || 1);
     const inventoryRatio = clamp(maker.inventory / maxInventory, -1.25, 1.25);
     const widenTicks = this.maybeWidenSpread(marketState, orderBook);
     const baseOffsetTicks = Math.max(1, this.config.baseSpreadTicks || 1) + widenTicks;
-    const inventoryShiftTicks = inventoryRatio * (this.config.inventorySkewStrength || 0);
-    const shiftedReference = referencePrice - inventoryShiftTicks * tickSize;
+    const rawInventoryShiftTicks = inventoryRatio
+      * (this.config.inventorySkewStrength || 0)
+      * INVENTORY_SKEW_SCALE;
+    const maxInventoryShiftTicks = Math.max(0.5, baseOffsetTicks * 0.4);
+    const inventoryShiftTicks = clamp(
+      rawInventoryShiftTicks,
+      -maxInventoryShiftTicks,
+      maxInventoryShiftTicks
+    );
+    const shiftedReference = fairPrice - inventoryShiftTicks * tickSize;
 
     let bidPrice = shiftedReference - baseOffsetTicks * tickSize;
     let askPrice = shiftedReference + baseOffsetTicks * tickSize;
+    const joinProbability = clamp(this.config.probabilityOfJoiningBestBidAsk || 0, 0, 1);
+    const oneTickAwayProbability = clamp(this.config.probabilityOfQuotingOneTickAway || 0, 0, 1);
+    const quoteOneTickAway = sampleSizes && this.rng.bool(oneTickAwayProbability);
+    const joinSide = sampleSizes && this.rng.bool(joinProbability)
+      ? (this.rng.bool(0.5) ? 'bid' : 'ask')
+      : null;
+    const joinBothSides = !!joinSide
+      && sampleSizes
+      && this.rng.bool(Math.min(joinProbability * 0.15, MAX_JOIN_BOTH_SIDES_PROBABILITY));
 
-    if (sampleSizes && this.rng.bool(this.config.probabilityOfJoiningBestBidAsk || 0)) {
+    if (joinSide === 'bid' || joinBothSides) {
       bidPrice = Math.max(bidPrice, bestBid);
-    } else if (sampleSizes && this.rng.bool(this.config.probabilityOfQuotingOneTickAway || 0)) {
+    } else if (quoteOneTickAway) {
       bidPrice = Math.min(bidPrice, bestBid - tickSize);
     }
 
-    if (sampleSizes && this.rng.bool(this.config.probabilityOfJoiningBestBidAsk || 0)) {
+    if (joinSide === 'ask' || joinBothSides) {
       askPrice = Math.min(askPrice, bestAsk);
-    } else if (sampleSizes && this.rng.bool(this.config.probabilityOfQuotingOneTickAway || 0)) {
+    } else if (quoteOneTickAway) {
       askPrice = Math.max(askPrice, bestAsk + tickSize);
     }
 

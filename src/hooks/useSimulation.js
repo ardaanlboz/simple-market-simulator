@@ -8,6 +8,66 @@ import { SimulationLoop } from '../engine/simulationLoop.js';
 import { useSimulationStore } from '../store/simulationStore.js';
 import { createOrder } from '../engine/orderBook.js';
 
+/**
+ * Process user fill records arriving from the engine callback.
+ * Handles both latency-delayed fills and resting-order fills.
+ */
+function processUserFills(store, data) {
+  if (!data.userFills || data.userFills.length === 0) return;
+
+  for (const fill of data.userFills) {
+    if (fill.isRestingFill) {
+      // A resting limit order was hit by another agent
+      store.getState().recordUserTrade({
+        side: fill.side,
+        price: fill.trades[0].price,
+        size: fill.trades[0].size,
+        tick: fill.trades[0].tick,
+        timestamp: fill.trades[0].timestamp,
+      });
+    } else {
+      // Our order arrived (possibly after delay) and matched
+      const { order, trades, summary } = fill;
+      const side = order.side;
+      if (order.type === 'market' && summary?.filledSize > 0) {
+        store.getState().recordUserTrade({
+          side,
+          price: summary.averageFillPrice,
+          size: summary.filledSize,
+          tick: summary.tick ?? data.tick,
+          timestamp: summary.timestamp,
+          arrivalPrice: summary.arrivalPrice,
+          referencePrice: summary.referencePrice,
+          slippage: summary.totalSlippage,
+          slippageBps: summary.totalSlippageBps,
+          impactSlippage: summary.quoteSlippage,
+          impactSlippageBps: summary.quoteSlippageBps,
+          levelsSwept: summary.levelsSwept,
+          quoteFadeVolume: summary.quoteFadeVolume,
+        });
+      } else {
+        for (const trade of trades) {
+          store.getState().recordUserTrade({
+            side,
+            price: trade.price,
+            size: trade.size,
+            tick: trade.tick,
+            timestamp: trade.timestamp,
+          });
+        }
+      }
+    }
+  }
+}
+
+function createEngineCallback(store) {
+  return (data) => {
+    store.getState().updateFromEngine(data);
+    processUserFills(store, data);
+    store.getState().updateUnrealizedPnl();
+  };
+}
+
 export function useSimulation() {
   const engineRef = useRef(null);
   const store = useSimulationStore;
@@ -16,10 +76,7 @@ export function useSimulation() {
 
   // Initialize engine
   useEffect(() => {
-    const engine = new SimulationLoop(config, (data) => {
-      store.getState().updateFromEngine(data);
-      store.getState().updateUnrealizedPnl();
-    });
+    const engine = new SimulationLoop(config, createEngineCallback(store));
     engineRef.current = engine;
     // Push initial state
     engine._pushUpdate();
@@ -53,10 +110,7 @@ export function useSimulation() {
 
   const reset = useCallback(() => {
     const state = store.getState();
-    const engine = new SimulationLoop(state.config, (data) => {
-      store.getState().updateFromEngine(data);
-      store.getState().updateUnrealizedPnl();
-    });
+    const engine = new SimulationLoop(state.config, createEngineCallback(store));
     engineRef.current?.destroy();
     engineRef.current = engine;
     state.resetUser();
@@ -85,34 +139,38 @@ export function useSimulation() {
       lifetime: type === 'limit' ? 5000 : null,
     });
 
-    const { trades, summary } = engine.processUserOrder(order);
-
-    // Record fills
-    if (type === 'market' && summary?.filledSize > 0) {
-      store.getState().recordUserTrade({
-        side,
-        price: summary.averageFillPrice,
-        size: summary.filledSize,
-        tick: summary.tick ?? state.tick,
-        timestamp: summary.timestamp,
-        arrivalPrice: summary.arrivalPrice,
-        referencePrice: summary.referencePrice,
-        slippage: summary.totalSlippage,
-        slippageBps: summary.totalSlippageBps,
-        impactSlippage: summary.quoteSlippage,
-        impactSlippageBps: summary.quoteSlippageBps,
-        levelsSwept: summary.levelsSwept,
-        quoteFadeVolume: summary.quoteFadeVolume,
-      });
+    if (engine.config.enableLatency) {
+      // Schedule through the event queue — fills arrive via callback later
+      engine.scheduleUserOrder(order);
     } else {
-      for (const trade of trades) {
+      // Direct execution — record fills immediately
+      const { trades, summary } = engine.processUserOrder(order);
+      if (type === 'market' && summary?.filledSize > 0) {
         store.getState().recordUserTrade({
           side,
-          price: trade.price,
-          size: trade.size,
-          tick: trade.tick,
-          timestamp: trade.timestamp,
+          price: summary.averageFillPrice,
+          size: summary.filledSize,
+          tick: summary.tick ?? state.tick,
+          timestamp: summary.timestamp,
+          arrivalPrice: summary.arrivalPrice,
+          referencePrice: summary.referencePrice,
+          slippage: summary.totalSlippage,
+          slippageBps: summary.totalSlippageBps,
+          impactSlippage: summary.quoteSlippage,
+          impactSlippageBps: summary.quoteSlippageBps,
+          levelsSwept: summary.levelsSwept,
+          quoteFadeVolume: summary.quoteFadeVolume,
         });
+      } else {
+        for (const trade of trades) {
+          store.getState().recordUserTrade({
+            side,
+            price: trade.price,
+            size: trade.size,
+            tick: trade.tick,
+            timestamp: trade.timestamp,
+          });
+        }
       }
     }
   }, [store]);
@@ -120,7 +178,12 @@ export function useSimulation() {
   const cancelUserOrder = useCallback((orderId) => {
     const engine = engineRef.current;
     if (!engine) return;
-    engine.cancelUserOrder(orderId);
+
+    if (engine.config.enableLatency) {
+      engine.scheduleUserCancel(orderId);
+    } else {
+      engine.cancelUserOrder(orderId);
+    }
   }, []);
 
   const getEngine = useCallback(() => engineRef.current, []);

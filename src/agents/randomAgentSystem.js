@@ -36,7 +36,7 @@ export class RandomAgentSystem {
 
   initAgents() {
     this.agents = [];
-    const n = this.config.numAgents || 100;
+    const n = this.config.numAgents ?? 100;
 
     for (let i = 0; i < n; i++) {
       this.agents.push({
@@ -179,24 +179,29 @@ export class RandomAgentSystem {
 
   /**
    * Process one tick for all agents.
-   * Returns array of orders to submit to the matching engine.
+   * Returns { orders, cancels } where cancels are deferred requests
+   * (not executed directly) so the simulation loop can route them
+   * through the latency event queue.
    */
   tick(currentTick, midPrice, orderBook) {
     const orders = [];
+    const cancels = [];
 
-    if (midPrice == null || midPrice <= 0) return orders;
+    if (midPrice == null || midPrice <= 0) return { orders, cancels };
     this._updateMarketState(midPrice);
 
     const state = this.marketState;
 
     for (const agent of this.agents) {
       // --- Cancellation pass ---
-      // Each agent may cancel one of their resting orders
+      // Each agent may request cancellation of one resting order.
+      // The cancel is returned (not applied directly) so the simulation
+      // loop can delay it through the event queue.
       const agentOrderIds = orderBook.getAgentOrderIds(agent.id);
       if (agentOrderIds.length > 0 && this.rng.bool(agent.cancelRate * this.config.cancelProbability)) {
         const cancelId = this.rng.pick(agentOrderIds);
         if (cancelId) {
-          orderBook.cancelOrder(cancelId);
+          cancels.push({ orderId: cancelId, agentId: agent.id });
         }
       }
 
@@ -267,7 +272,7 @@ export class RandomAgentSystem {
       orders.push(order);
     }
 
-    return orders;
+    return { orders, cancels };
   }
 
   /** Reconfigure agents (e.g., when user changes params) */

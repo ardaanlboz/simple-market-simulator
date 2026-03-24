@@ -7,6 +7,7 @@
  */
 
 let nextOrderId = 1;
+let nextSequenceNumber = 1;
 
 export const ORDER_STATUS = {
   OPEN: 'open',
@@ -18,6 +19,10 @@ export const ORDER_STATUS = {
 
 function clampQuantity(value) {
   return Math.max(0, Number.isFinite(value) ? value : 0);
+}
+
+function clampSequenceNumber(value) {
+  return Math.max(0, Number.isFinite(value) ? Math.trunc(value) : 0);
 }
 
 function toCanonicalStatus(status) {
@@ -55,6 +60,8 @@ export function normalizeOrderFields(order) {
   }
 
   const timestamp = order.timestamp ?? order.createdAt ?? 0;
+  const sequenceNumber = clampSequenceNumber(order.sequenceNumber ?? order.insertionIndex)
+    || nextSequenceNumber++;
   const status = toCanonicalStatus(order.status);
 
   order.quantity = quantity;
@@ -64,6 +71,8 @@ export function normalizeOrderFields(order) {
   order.remainingSize = remainingQuantity;
   order.timestamp = timestamp;
   order.createdAt = timestamp;
+  order.sequenceNumber = sequenceNumber;
+  order.insertionIndex = sequenceNumber;
 
   if (status === ORDER_STATUS.CANCELLED || status === ORDER_STATUS.EXPIRED) {
     order.status = status;
@@ -98,8 +107,13 @@ export function createOrderId() {
   return `ORD-${nextOrderId++}`;
 }
 
+export function createOrderSequenceNumber() {
+  return nextSequenceNumber++;
+}
+
 export function resetOrderIdCounter() {
   nextOrderId = 1;
+  nextSequenceNumber = 1;
 }
 
 /**
@@ -127,6 +141,7 @@ export function createOrder({
     remainingQuantity: quantity ?? size,
     agentId,
     timestamp: timestamp ?? tick,
+    sequenceNumber: createOrderSequenceNumber(),
     expiresAt: lifetime != null ? tick + lifetime : null,
     status: ORDER_STATUS.OPEN,
   });
@@ -149,6 +164,67 @@ function findPriceIndex(levels, price, descending) {
     }
   }
   return low;
+}
+
+function compareOrderPriority(a, b) {
+  normalizeOrderFields(a);
+  normalizeOrderFields(b);
+
+  if (a.timestamp !== b.timestamp) {
+    return a.timestamp - b.timestamp;
+  }
+
+  if (a.sequenceNumber !== b.sequenceNumber) {
+    return a.sequenceNumber - b.sequenceNumber;
+  }
+
+  return String(a.id).localeCompare(String(b.id));
+}
+
+function findQueueInsertionIndex(queue, order) {
+  let low = 0;
+  let high = queue.length;
+
+  while (low < high) {
+    const mid = (low + high) >>> 1;
+    if (compareOrderPriority(queue[mid], order) <= 0) {
+      low = mid + 1;
+    } else {
+      high = mid;
+    }
+  }
+
+  return low;
+}
+
+function sumLevelSize(level) {
+  return level.orders.reduce((sum, order) => sum + normalizeOrderFields(order).remainingQuantity, 0);
+}
+
+function summarizeLevel(level) {
+  const queuePreview = level.orders.slice(0, 5).map((order, index) => {
+    normalizeOrderFields(order);
+    return {
+      id: order.id,
+      agentId: order.agentId,
+      remainingQuantity: order.remainingQuantity,
+      queuePosition: index + 1,
+      timestamp: order.timestamp,
+      sequenceNumber: order.sequenceNumber,
+    };
+  });
+
+  return {
+    price: level.price,
+    size: sumLevelSize(level),
+    count: level.orders.length,
+    frontOrderId: level.orders[0]?.id ?? null,
+    frontAgentId: level.orders[0]?.agentId ?? null,
+    frontTimestamp: level.orders[0]?.timestamp ?? null,
+    frontSequenceNumber: level.orders[0]?.sequenceNumber ?? null,
+    queuePreview,
+    hasMoreInQueue: level.orders.length > queuePreview.length,
+  };
 }
 
 export class OrderBook {
@@ -193,6 +269,7 @@ export class OrderBook {
   addOrder(order) {
     normalizeOrderFields(order);
     if (order.type !== 'limit' || order.remainingQuantity <= 0) return;
+    if (this.orderMap.has(order.id)) return;
 
     const side = order.side === 'buy' ? this.bids : this.asks;
     const descending = order.side === 'buy';
@@ -202,8 +279,8 @@ export class OrderBook {
     const idx = findPriceIndex(side, price, descending);
 
     if (idx < side.length && Math.abs(side[idx].price - price) < this.tickSize / 2) {
-      // Price level exists — append to queue
-      side[idx].orders.push(order);
+      const queueIdx = findQueueInsertionIndex(side[idx].orders, order);
+      side[idx].orders.splice(queueIdx, 0, order);
     } else {
       // New price level
       side.splice(idx, 0, { price, orders: [order] });
@@ -229,7 +306,7 @@ export class OrderBook {
     for (let i = 0; i < side.length; i++) {
       if (Math.abs(side[i].price - price) < this.tickSize / 2) {
         const level = side[i];
-        const orderIdx = level.orders.indexOf(order);
+        const orderIdx = level.orders.findIndex((levelOrder) => levelOrder.id === orderId);
         if (orderIdx !== -1) {
           level.orders.splice(orderIdx, 1);
           if (level.orders.length === 0) {
@@ -285,19 +362,46 @@ export class OrderBook {
     return this.orderMap.get(orderId);
   }
 
+  getBestBidLevel() {
+    return this.bids[0] ?? null;
+  }
+
+  getBestAskLevel() {
+    return this.asks[0] ?? null;
+  }
+
+  getQueuePosition(orderId) {
+    const order = this.orderMap.get(orderId);
+    if (!order) return null;
+
+    normalizeOrderFields(order);
+    const side = order.side === 'buy' ? this.bids : this.asks;
+
+    for (const level of side) {
+      if (Math.abs(level.price - order.price) >= this.tickSize / 2) continue;
+
+      const position = level.orders.findIndex((levelOrder) => levelOrder.id === orderId);
+      if (position === -1) continue;
+
+      return {
+        position: position + 1,
+        levelOrderCount: level.orders.length,
+        levelPrice: level.price,
+        levelSize: sumLevelSize(level),
+        side: order.side,
+        timestamp: order.timestamp,
+        sequenceNumber: order.sequenceNumber,
+      };
+    }
+
+    return null;
+  }
+
   /** Get depth snapshot: N best levels per side */
   getDepth(levels = 20) {
-    const bidLevels = this.bids.slice(0, levels).map(l => ({
-      price: l.price,
-      size: l.orders.reduce((sum, o) => sum + normalizeOrderFields(o).remainingQuantity, 0),
-      count: l.orders.length,
-    }));
+    const bidLevels = this.bids.slice(0, levels).map((level) => summarizeLevel(level));
 
-    const askLevels = this.asks.slice(0, levels).map(l => ({
-      price: l.price,
-      size: l.orders.reduce((sum, o) => sum + normalizeOrderFields(o).remainingQuantity, 0),
-      count: l.orders.length,
-    }));
+    const askLevels = this.asks.slice(0, levels).map((level) => summarizeLevel(level));
 
     return { bidLevels, askLevels };
   }
@@ -306,14 +410,14 @@ export class OrderBook {
   getCumulativeDepth(levels = 50) {
     let cumBid = 0;
     const bidDepth = this.bids.slice(0, levels).map(l => {
-      const size = l.orders.reduce((sum, o) => sum + normalizeOrderFields(o).remainingQuantity, 0);
+      const size = sumLevelSize(l);
       cumBid += size;
       return { price: l.price, size, cumulative: cumBid };
     });
 
     let cumAsk = 0;
     const askDepth = this.asks.slice(0, levels).map(l => {
-      const size = l.orders.reduce((sum, o) => sum + normalizeOrderFields(o).remainingQuantity, 0);
+      const size = sumLevelSize(l);
       cumAsk += size;
       return { price: l.price, size, cumulative: cumAsk };
     });

@@ -1,12 +1,21 @@
 /**
  * Simulation Loop — orchestrates the market simulation.
  *
- * On each tick:
- * 1. Agents generate orders
- * 2. Orders are processed by matching engine
- * 3. Expired orders are removed
+ * On each tick (latency disabled):
+ * 1. Expired orders are removed
+ * 2. Agents generate orders
+ * 3. Orders are processed by the matching engine
  * 4. Metrics are updated
  * 5. Display state is pushed to callback
+ *
+ * On each tick (latency enabled):
+ * 1. Expired orders are removed
+ * 2. Due events fire from the event queue (cancels first, then submissions)
+ * 3. Agents observe the market and generate decisions
+ * 4. Decisions are scheduled into the event queue with sampled delays
+ * 5. Any delay-0 events fire immediately
+ * 6. Metrics are updated
+ * 7. Display state is pushed to callback
  */
 
 import { OrderBook, resetOrderIdCounter } from './orderBook.js';
@@ -16,6 +25,7 @@ import { PatternDetector } from './patternDetector.js';
 import { RandomAgentSystem } from '../agents/randomAgentSystem.js';
 import { MarketMakerSystem } from '../agents/marketMakerSystem.js';
 import { SeededRng } from './seededRng.js';
+import { EventQueue, EVENT_TYPES, sampleLatency } from './eventQueue.js';
 
 function sampleOffset(rng, tickSize, meanTicks) {
   const lambda = 1 / Math.max(1, meanTicks);
@@ -41,12 +51,14 @@ export class SimulationLoop {
 
     this.rng = new SeededRng(config.seed);
     this.marketMakerRng = new SeededRng(config.seed + 1009);
+    this.latencyRng = new SeededRng(config.seed + 2017);
     this.orderBook = new OrderBook(config.tickSize);
     this.matchingEngine = new MatchingEngine(this.orderBook, config);
     this.metricsEngine = new MetricsEngine(config);
     this.patternDetector = new PatternDetector(config);
     this.agentSystem = new RandomAgentSystem(this.rng, config);
     this.marketMakerSystem = new MarketMakerSystem(this.marketMakerRng, config);
+    this.eventQueue = new EventQueue();
 
     this.tick = 0;
     this.lastPrice = config.initialPrice;
@@ -58,6 +70,7 @@ export class SimulationLoop {
     this.maxTicksPerFrame = 250;
     this._tickAccumulator = 0;
     this._lastFrameAt = 0;
+    this._pendingUserFills = [];
 
     // History for replay
     this.history = [];
@@ -74,7 +87,6 @@ export class SimulationLoop {
     const rng = this.rng;
     const meanOffsetTicks = 3 + this.config.priceOffsetRange * 8;
 
-    // Place dense liquidity close to the mid so price discovery is smooth.
     for (let i = 0; i < 300; i++) {
       const isBuy = rng.bool(0.5);
       const offset = sampleOffset(rng, tickSize, meanOffsetTicks);
@@ -151,12 +163,15 @@ export class SimulationLoop {
     resetOrderIdCounter();
     this.rng = new SeededRng(this.config.seed);
     this.marketMakerRng = new SeededRng(this.config.seed + 1009);
+    this.latencyRng = new SeededRng(this.config.seed + 2017);
     this.orderBook = new OrderBook(this.config.tickSize);
     this.matchingEngine = new MatchingEngine(this.orderBook, this.config);
     this.metricsEngine = new MetricsEngine(this.config);
     this.patternDetector = new PatternDetector(this.config);
     this.agentSystem = new RandomAgentSystem(this.rng, this.config);
     this.marketMakerSystem = new MarketMakerSystem(this.marketMakerRng, this.config);
+    this.eventQueue.reset();
+    this._pendingUserFills = [];
     this.history = [];
     this._seedInitialLiquidity();
     this._pushUpdate();
@@ -173,6 +188,7 @@ export class SimulationLoop {
 
   /** Update config */
   updateConfig(newConfig) {
+    const wasLatencyEnabled = !!this.config.enableLatency;
     this.config = { ...this.config, ...newConfig };
     this.agentSystem.updateConfig(this.config);
     this.marketMakerSystem.updateConfig(newConfig, this.orderBook, this.tick);
@@ -181,6 +197,11 @@ export class SimulationLoop {
 
     if (this.isRunning && !this.isPaused && newConfig.tickInterval != null) {
       this._scheduleLoop();
+    }
+
+    // If latency was just disabled, flush all pending events immediately
+    if (wasLatencyEnabled && newConfig.enableLatency === false) {
+      this._flushEventQueue();
     }
 
     if (
@@ -196,6 +217,7 @@ export class SimulationLoop {
       || newConfig.probabilityOfJoiningBestBidAsk != null
       || newConfig.probabilityOfQuotingOneTickAway != null
       || newConfig.quoteSizeRange != null
+      || newConfig.enableLatency != null
     ) {
       this._pushUpdate();
     }
@@ -235,27 +257,46 @@ export class SimulationLoop {
     if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
       return performance.now();
     }
-
     return Date.now();
   }
+
+  // ---------------------------------------------------------------------------
+  //  Core tick processing
+  // ---------------------------------------------------------------------------
 
   /** Process a single tick */
   _processTick() {
     this.tick++;
+    this._pendingUserFills = [];
 
     // 1. Remove expired orders
     this.orderBook.removeExpired(this.tick);
 
-    // 2. Agents generate orders
+    if (this.config.enableLatency) {
+      this._processTickWithLatency();
+    } else {
+      this._processTickDirect();
+    }
+  }
+
+  /** Original direct-execution path (latency disabled) */
+  _processTickDirect() {
     const midPrice = this.orderBook.midPrice || this.lastPrice;
     const makerOrders = this.marketMakerSystem.tick(
       this.tick,
       this._getExecutionContext(),
       this.orderBook
     );
-    const agentOrders = this.agentSystem.tick(this.tick, midPrice, this.orderBook);
+    const agentResult = this.agentSystem.tick(this.tick, midPrice, this.orderBook);
+    const agentOrders = agentResult.orders ?? agentResult;
+    const agentCancels = agentResult.cancels ?? [];
 
-    // 3. Process each order through matching engine
+    // Execute agent cancels directly
+    for (const cancel of agentCancels) {
+      this.orderBook.cancelOrder(cancel.orderId);
+    }
+
+    // Process each order through matching engine
     const allTrades = [];
     for (const order of [...makerOrders, ...agentOrders]) {
       const { trades } = this.matchingEngine.processOrder(
@@ -266,16 +307,170 @@ export class SimulationLoop {
       allTrades.push(...trades);
     }
 
-    // 4. Update last price from trades
+    this._collectUserFills(allTrades);
+    this._finalizeTick(allTrades);
+  }
+
+  /** Latency-aware path: events fire from the queue, new decisions are scheduled */
+  _processTickWithLatency() {
+    const allTrades = [];
+
+    // --- Phase 1: fire due events from the queue ---
+    const dueEvents = this.eventQueue.processDueEvents(this.tick);
+    for (const event of dueEvents) {
+      if (event.type === EVENT_TYPES.CANCEL_ORDER) {
+        this._executeCancelEvent(event);
+      } else if (event.type === EVENT_TYPES.SUBMIT_ORDER) {
+        allTrades.push(...this._executeSubmitEvent(event));
+      }
+    }
+
     if (allTrades.length > 0) {
       this.lastPrice = allTrades[allTrades.length - 1].price;
     }
 
-    // 5. Update metrics
+    // --- Phase 2: agents observe the (now-updated) market and decide ---
+    const snapshot = this._captureMarketSnapshot();
+    const midPrice = this.orderBook.midPrice || this.lastPrice;
+
+    const makerOrders = this.marketMakerSystem.tick(
+      this.tick,
+      this._getExecutionContext(),
+      this.orderBook
+    );
+    const agentResult = this.agentSystem.tick(this.tick, midPrice, this.orderBook);
+    const agentOrders = agentResult.orders ?? agentResult;
+    const agentCancels = agentResult.cancels ?? [];
+
+    // --- Phase 3: schedule agent cancellations ---
+    for (const cancel of agentCancels) {
+      const delay = sampleLatency(
+        this.config.cancellationDelayMin,
+        this.config.cancellationDelayMax,
+        this.latencyRng
+      );
+      this.eventQueue.schedule({
+        type: EVENT_TYPES.CANCEL_ORDER,
+        sourceId: cancel.agentId,
+        payload: { orderId: cancel.orderId },
+        createdAt: this.tick,
+        scheduledFor: this.tick + delay,
+        snapshot,
+      });
+    }
+
+    // --- Phase 4: schedule agent order submissions ---
+    for (const order of agentOrders) {
+      const reactionDelay = sampleLatency(
+        this.config.agentReactionDelayMin,
+        this.config.agentReactionDelayMax,
+        this.latencyRng
+      );
+      const submissionDelay = sampleLatency(
+        this.config.orderSubmissionDelayMin,
+        this.config.orderSubmissionDelayMax,
+        this.latencyRng
+      );
+      this.eventQueue.schedule({
+        type: EVENT_TYPES.SUBMIT_ORDER,
+        sourceId: order.agentId,
+        payload: { order },
+        createdAt: this.tick,
+        scheduledFor: this.tick + reactionDelay + submissionDelay,
+        snapshot,
+      });
+    }
+
+    // --- Phase 5: schedule market maker order submissions (shorter delay) ---
+    for (const order of makerOrders) {
+      const submissionDelay = sampleLatency(
+        this.config.makerSubmissionDelayMin ?? 0,
+        this.config.makerSubmissionDelayMax ?? 2,
+        this.latencyRng
+      );
+      this.eventQueue.schedule({
+        type: EVENT_TYPES.SUBMIT_ORDER,
+        sourceId: order.agentId,
+        payload: { order },
+        createdAt: this.tick,
+        scheduledFor: this.tick + submissionDelay,
+        snapshot,
+      });
+    }
+
+    // --- Phase 6: fire any delay-0 events that were just scheduled ---
+    const immediateDue = this.eventQueue.processDueEvents(this.tick);
+    for (const event of immediateDue) {
+      if (event.type === EVENT_TYPES.CANCEL_ORDER) {
+        this._executeCancelEvent(event);
+      } else if (event.type === EVENT_TYPES.SUBMIT_ORDER) {
+        allTrades.push(...this._executeSubmitEvent(event));
+      }
+    }
+
+    this._collectUserFills(allTrades);
+    this._finalizeTick(allTrades);
+  }
+
+  // ---------------------------------------------------------------------------
+  //  Event execution
+  // ---------------------------------------------------------------------------
+
+  /** Execute a cancel event against the live book */
+  _executeCancelEvent(event) {
+    const { orderId } = event.payload;
+    const order = this.orderBook.getOrder(orderId);
+    if (order) {
+      order.cancelRequestedAt = event.createdAt;
+      order.cancelledAt = this.tick;
+      this.orderBook.cancelOrder(orderId);
+      event.result = 'cancelled';
+    } else {
+      // Order may already be filled or expired — or still pending submission
+      const removed = this.eventQueue.removePendingSubmitForOrder(orderId);
+      event.result = removed ? 'cancelled_pending' : 'already_gone';
+    }
+  }
+
+  /** Execute an order submission event against the live book */
+  _executeSubmitEvent(event) {
+    const order = event.payload.order;
+    order.submittedAt = event.createdAt;
+    order.enteredBookAt = this.tick;
+
+    const result = this.matchingEngine.processOrder(
+      order,
+      this.tick,
+      this._getExecutionContext()
+    );
+    const { trades, summary } = result;
+
+    // Capture user fills for the UI callback
+    if (order.agentId === 'user' && trades.length > 0) {
+      this._pendingUserFills.push({
+        order,
+        trades,
+        summary,
+        snapshot: event.snapshot,
+      });
+    }
+
+    event.result = trades.length > 0 ? `filled_${trades.length}` : 'rested';
+    return trades;
+  }
+
+  // ---------------------------------------------------------------------------
+  //  Shared tick finalization
+  // ---------------------------------------------------------------------------
+
+  _finalizeTick(allTrades) {
+    if (allTrades.length > 0) {
+      this.lastPrice = allTrades[allTrades.length - 1].price;
+    }
+
     this.metricsEngine.processTick(this.tick, allTrades, this.orderBook, this.lastPrice);
     this.marketMakerSystem.handleFills(allTrades, this.tick);
 
-    // 6. Detect patterns periodically
     if (this.tick % 50 === 0) {
       this.patternDetector.analyze(
         this.metricsEngine.candles,
@@ -284,7 +479,6 @@ export class SimulationLoop {
       );
     }
 
-    // 7. Record history snapshot (periodic)
     if (this.tick % 10 === 0 && this.history.length < this.maxHistoryLength) {
       this.history.push({
         tick: this.tick,
@@ -298,12 +492,183 @@ export class SimulationLoop {
     }
   }
 
+  /**
+   * Scan trade list for fills involving user resting orders.
+   * These fills are not captured by _executeSubmitEvent (which only
+   * captures fills from the user's OWN incoming order), so we detect
+   * them here from the aggressor's trade list.
+   */
+  _collectUserFills(allTrades) {
+    for (const trade of allTrades) {
+      const isUserBuy = trade.buyAgentId === 'user';
+      const isUserSell = trade.sellAgentId === 'user';
+      if (!isUserBuy && !isUserSell) continue;
+
+      // Avoid double-counting fills already captured in _executeSubmitEvent
+      const alreadyCaptured = this._pendingUserFills.some((f) =>
+        f.trades.some((t) => t.id === trade.id)
+      );
+      if (alreadyCaptured) continue;
+
+      this._pendingUserFills.push({
+        trades: [trade],
+        side: isUserBuy ? 'buy' : 'sell',
+        isRestingFill: true,
+      });
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  //  Market snapshot
+  // ---------------------------------------------------------------------------
+
+  _captureMarketSnapshot() {
+    return {
+      tick: this.tick,
+      lastPrice: this.lastPrice,
+      bestBid: this.orderBook.bestBid,
+      bestAsk: this.orderBook.bestAsk,
+      spread: this.orderBook.spread,
+      midPrice: this.orderBook.midPrice || this.lastPrice,
+      volatility: this.metricsEngine.volatility,
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  //  User order scheduling (latency-aware)
+  // ---------------------------------------------------------------------------
+
+  /** Schedule a user order through the event queue */
+  scheduleUserOrder(order) {
+    const delay = sampleLatency(
+      this.config.userOrderDelayMin,
+      this.config.userOrderDelayMax,
+      this.latencyRng
+    );
+    this.eventQueue.schedule({
+      type: EVENT_TYPES.SUBMIT_ORDER,
+      sourceId: 'user',
+      payload: { order },
+      createdAt: this.tick,
+      scheduledFor: this.tick + delay,
+      snapshot: this._captureMarketSnapshot(),
+    });
+    this._pushUpdate();
+  }
+
+  /** Schedule a user cancel through the event queue */
+  scheduleUserCancel(orderId) {
+    const delay = sampleLatency(
+      this.config.userOrderDelayMin,
+      this.config.userOrderDelayMax,
+      this.latencyRng
+    );
+    this.eventQueue.schedule({
+      type: EVENT_TYPES.CANCEL_ORDER,
+      sourceId: 'user',
+      payload: { orderId },
+      createdAt: this.tick,
+      scheduledFor: this.tick + delay,
+      snapshot: this._captureMarketSnapshot(),
+    });
+    this._pushUpdate();
+  }
+
+  // ---------------------------------------------------------------------------
+  //  Direct user order processing (latency disabled)
+  // ---------------------------------------------------------------------------
+
+  /** Process a user-submitted order immediately (no latency) */
+  processUserOrder(order) {
+    const result = this.matchingEngine.processOrder(
+      order,
+      this.tick,
+      this._getExecutionContext()
+    );
+    const { trades } = result;
+    if (trades.length > 0) {
+      this.lastPrice = trades[trades.length - 1].price;
+      this.metricsEngine.processTrades(this.tick, trades);
+      this.marketMakerSystem.handleFills(trades, this.tick);
+    }
+    this._pushUpdate();
+    return result;
+  }
+
+  /** Cancel a user order immediately (no latency) */
+  cancelUserOrder(orderId) {
+    const cancelled = this.orderBook.cancelOrder(orderId);
+    this._pushUpdate();
+    return cancelled;
+  }
+
+  // ---------------------------------------------------------------------------
+  //  Flush / cleanup
+  // ---------------------------------------------------------------------------
+
+  /** Flush all pending events immediately (used when latency is toggled off) */
+  _flushEventQueue() {
+    // Process all pending events regardless of scheduledFor
+    const all = this.eventQueue.events.filter((e) => e.status === 'pending');
+    this.eventQueue.events = [];
+
+    all.sort((a, b) => {
+      const pa = { CANCEL_ORDER: 1, SUBMIT_ORDER: 2 }[a.type] ?? 99;
+      const pb = { CANCEL_ORDER: 1, SUBMIT_ORDER: 2 }[b.type] ?? 99;
+      if (pa !== pb) return pa - pb;
+      return a.sequenceNumber - b.sequenceNumber;
+    });
+
+    const trades = [];
+    for (const event of all) {
+      event.status = 'flushed';
+      event.executedAt = this.tick;
+      if (event.type === EVENT_TYPES.CANCEL_ORDER) {
+        this._executeCancelEvent(event);
+      } else if (event.type === EVENT_TYPES.SUBMIT_ORDER) {
+        trades.push(...this._executeSubmitEvent(event));
+      }
+    }
+
+    if (trades.length > 0) {
+      this.lastPrice = trades[trades.length - 1].price;
+      this.metricsEngine.processTrades(this.tick, trades);
+      this.marketMakerSystem.handleFills(trades, this.tick);
+    }
+  }
+
+  /** Clean up */
+  destroy() {
+    if (this.intervalId) clearInterval(this.intervalId);
+    this.isRunning = false;
+  }
+
+  // ---------------------------------------------------------------------------
+  //  Helpers
+  // ---------------------------------------------------------------------------
+
+  _getExecutionContext() {
+    const recentTrades = this.metricsEngine.recentTrades;
+    const lookbackWindow = recentTrades.slice(-8);
+    const firstPrice = lookbackWindow[0]?.price ?? this.lastPrice;
+    const lastPrice = lookbackWindow[lookbackWindow.length - 1]?.price ?? this.lastPrice;
+
+    return {
+      lastPrice: this.lastPrice,
+      midPrice: this.orderBook.midPrice || this.lastPrice,
+      spread: this.orderBook.spread,
+      volatility: this.metricsEngine.volatility,
+      priceVelocity: Math.abs(lastPrice - firstPrice),
+    };
+  }
+
   /** Push display state to UI */
   _pushUpdate() {
     if (!this.onUpdate) return;
 
     const depth = this.orderBook.getDepth(25);
     const cumulativeDepth = this.orderBook.getCumulativeDepth(50);
+    const latencyEnabled = !!this.config.enableLatency;
 
     this.onUpdate({
       tick: this.tick,
@@ -330,52 +695,14 @@ export class SimulationLoop {
       userOrders: this._getUserOrdersSnapshot(),
       isRunning: this.isRunning,
       isPaused: this.isPaused,
+
+      // Latency / event queue
+      latencyEnabled,
+      pendingEvents: latencyEnabled ? this.eventQueue.getPendingSummary() : [],
+      pendingEventCount: latencyEnabled ? this.eventQueue.getPendingCount() : 0,
+      eventLog: latencyEnabled ? this.eventQueue.getRecentLog() : [],
+      userFills: this._pendingUserFills,
     });
-  }
-
-  /** Process a user-submitted order */
-  processUserOrder(order) {
-    const result = this.matchingEngine.processOrder(
-      order,
-      this.tick,
-      this._getExecutionContext()
-    );
-    const { trades } = result;
-    if (trades.length > 0) {
-      this.lastPrice = trades[trades.length - 1].price;
-      this.metricsEngine.processTrades(this.tick, trades);
-      this.marketMakerSystem.handleFills(trades, this.tick);
-    }
-    this._pushUpdate();
-    return result;
-  }
-
-  /** Cancel a user order */
-  cancelUserOrder(orderId) {
-    const cancelled = this.orderBook.cancelOrder(orderId);
-    this._pushUpdate();
-    return cancelled;
-  }
-
-  /** Clean up */
-  destroy() {
-    if (this.intervalId) clearInterval(this.intervalId);
-    this.isRunning = false;
-  }
-
-  _getExecutionContext() {
-    const recentTrades = this.metricsEngine.recentTrades;
-    const lookbackWindow = recentTrades.slice(-8);
-    const firstPrice = lookbackWindow[0]?.price ?? this.lastPrice;
-    const lastPrice = lookbackWindow[lookbackWindow.length - 1]?.price ?? this.lastPrice;
-
-    return {
-      lastPrice: this.lastPrice,
-      midPrice: this.orderBook.midPrice || this.lastPrice,
-      spread: this.orderBook.spread,
-      volatility: this.metricsEngine.volatility,
-      priceVelocity: Math.abs(lastPrice - firstPrice),
-    };
   }
 
   _getUserOrdersSnapshot() {
@@ -383,7 +710,20 @@ export class SimulationLoop {
       .getAgentOrderIds('user')
       .map((orderId) => this.orderBook.getOrder(orderId))
       .filter(Boolean)
-      .sort((a, b) => a.createdAt - b.createdAt)
-      .map((order) => ({ ...order }));
+      .sort((a, b) => (
+        (a.createdAt - b.createdAt)
+        || ((a.sequenceNumber || 0) - (b.sequenceNumber || 0))
+        || String(a.id).localeCompare(String(b.id))
+      ))
+      .map((order) => {
+        const queue = this.orderBook.getQueuePosition(order.id);
+        return {
+          ...order,
+          queuePosition: queue?.position ?? null,
+          priceLevelOrderCount: queue?.levelOrderCount ?? null,
+          levelPrice: queue?.levelPrice ?? order.price ?? null,
+          levelSize: queue?.levelSize ?? null,
+        };
+      });
   }
 }

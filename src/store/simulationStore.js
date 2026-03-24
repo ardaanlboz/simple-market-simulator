@@ -86,6 +86,12 @@ export const useSimulationStore = create((set, get) => ({
   userPnl: { realized: 0, unrealized: 0 },
   userEquityCurve: [],
 
+  // --- Latency / event queue ---
+  latencyEnabled: false,
+  pendingEvents: [],
+  pendingEventCount: 0,
+  eventLog: [],
+
   // --- UI state ---
   chartType: 'candlestick', // 'candlestick' | 'line'
   showPatterns: true,
@@ -121,6 +127,10 @@ export const useSimulationStore = create((set, get) => ({
     userOrders: data.userOrders,
     isRunning: data.isRunning,
     isPaused: data.isPaused,
+    latencyEnabled: data.latencyEnabled ?? false,
+    pendingEvents: data.pendingEvents ?? [],
+    pendingEventCount: data.pendingEventCount ?? 0,
+    eventLog: data.eventLog ?? [],
   }),
 
   setConfig: (updates) => set((state) => ({

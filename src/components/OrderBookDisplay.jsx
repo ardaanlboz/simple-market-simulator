@@ -14,6 +14,17 @@ export default function OrderBookDisplay() {
   // Show top 15 asks (reversed so lowest ask is at bottom) and top 15 bids
   const displayAsks = askLevels.slice(0, 15).reverse();
   const displayBids = bidLevels.slice(0, 15);
+  const formatQueueTitle = (level) => {
+    if (!level.queuePreview?.length) return '';
+
+    const preview = level.queuePreview
+      .map((order) => `${order.queuePosition}. ${order.agentId} x${formatSize(order.remainingQuantity)}`)
+      .join(' | ');
+
+    return level.hasMoreInQueue
+      ? `FIFO queue: ${preview} | ...`
+      : `FIFO queue: ${preview}`;
+  };
 
   return (
     <div className="flex flex-col h-full text-xs font-mono">
@@ -30,6 +41,7 @@ export default function OrderBookDisplay() {
           <div
             key={`ask-${i}`}
             className="flex justify-between items-center px-2 py-0.5 relative"
+            title={formatQueueTitle(level)}
           >
             <div
               className="absolute inset-0 opacity-20"
@@ -71,6 +83,7 @@ export default function OrderBookDisplay() {
           <div
             key={`bid-${i}`}
             className="flex justify-between items-center px-2 py-0.5 relative"
+            title={formatQueueTitle(level)}
           >
             <div
               className="absolute inset-0 opacity-20"

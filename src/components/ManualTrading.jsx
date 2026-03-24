@@ -16,6 +16,9 @@ export default function ManualTrading({ sim }) {
   const userPnl = useSimulationStore((s) => s.userPnl);
   const userOrders = useSimulationStore((s) => s.userOrders);
   const userTradeHistory = useSimulationStore((s) => s.userTradeHistory);
+  const latencyEnabled = useSimulationStore((s) => s.latencyEnabled);
+  const pendingEvents = useSimulationStore((s) => s.pendingEvents);
+  const pendingEventCount = useSimulationStore((s) => s.pendingEventCount);
 
   const handleSubmit = (e) => {
     e.preventDefault();
@@ -28,6 +31,15 @@ export default function ManualTrading({ sim }) {
       size: parseInt(size),
     });
   };
+
+  // Filter pending events for user-specific ones
+  const pendingUserSubmits = pendingEvents.filter(
+    (e) => e.sourceId === 'user' && e.type === 'SUBMIT_ORDER'
+  );
+  const pendingUserCancels = pendingEvents.filter(
+    (e) => e.sourceId === 'user' && e.type === 'CANCEL_ORDER'
+  );
+  const pendingCancelOrderIds = new Set(pendingUserCancels.map((e) => e.orderId));
 
   const equity = userBalance + userPnl.unrealized +
     Math.abs(userPosition.size) * (userPosition.size > 0 ? lastPrice : -lastPrice + 2 * userPosition.avgPrice);
@@ -99,6 +111,16 @@ export default function ManualTrading({ sim }) {
             SELL {bestBid ? `@ ${formatPrice(bestBid)}` : ''}
           </button>
         </div>
+
+        {/* Latency indicator */}
+        {latencyEnabled && (
+          <div className="text-[10px] text-amber-400/80 mt-1 px-1 py-1 rounded bg-amber-900/20 border border-amber-800/30">
+            Latency ON — {pendingEventCount} pending
+            {pendingUserSubmits.length > 0 && (
+              <span> | {pendingUserSubmits.length} in flight</span>
+            )}
+          </div>
+        )}
       </form>
 
       {/* Position & PnL */}
@@ -132,26 +154,75 @@ export default function ManualTrading({ sim }) {
         </div>
       </div>
 
-      {/* Open orders */}
+      {/* Open orders + pending */}
       <div className="flex flex-col flex-1 min-w-0">
-        <div className="text-gray-400 font-bold mb-1">Open Orders ({userOrders.length})</div>
+        <div className="text-gray-400 font-bold mb-1">
+          Open Orders ({userOrders.length})
+          {pendingUserSubmits.length > 0 && (
+            <span className="text-amber-400 font-normal ml-1">
+              + {pendingUserSubmits.length} in flight
+            </span>
+          )}
+        </div>
         <div className="flex-1 overflow-y-auto scrollbar-thin">
-          {userOrders.length === 0 ? (
+          {/* In-flight orders (submitted but not yet arrived at book) */}
+          {pendingUserSubmits.map((evt) => (
+            <div key={`pending-${evt.id}`} className="py-1 border-b border-gray-800/40 opacity-60">
+              <div className="flex items-center gap-2">
+                <span className={evt.side === 'buy' ? 'text-green-400' : 'text-red-400'}>
+                  {evt.side?.toUpperCase() ?? '?'}
+                </span>
+                <span className="text-gray-300">
+                  {evt.price != null ? formatPrice(evt.price) : 'MKT'}
+                </span>
+                <span className="text-amber-400 ml-auto text-[10px] uppercase tracking-wide animate-pulse">
+                  in flight
+                </span>
+              </div>
+              <div className="text-[10px] text-gray-500 mt-0.5">
+                Qty {evt.size} | {evt.orderType} | arrives tick {evt.scheduledFor}
+              </div>
+            </div>
+          ))}
+
+          {/* Resting orders in the book */}
+          {userOrders.length === 0 && pendingUserSubmits.length === 0 ? (
             <div className="text-gray-600">No open orders</div>
           ) : (
             userOrders.map((order) => (
-              <div key={order.id} className="flex items-center gap-2 py-0.5">
-                <span className={order.side === 'buy' ? 'text-green-400' : 'text-red-400'}>
-                  {order.side.toUpperCase()}
-                </span>
-                <span className="text-gray-300">{formatPrice(order.price)}</span>
-                <span className="text-gray-500">x{order.remainingSize}</span>
-                <button
-                  onClick={() => sim.cancelUserOrder(order.id)}
-                  className="text-red-500 hover:text-red-400 ml-auto"
-                >
-                  ✕
-                </button>
+              <div key={order.id} className="py-1 border-b border-gray-800/40 last:border-b-0">
+                <div className="flex items-center gap-2">
+                  <span className={order.side === 'buy' ? 'text-green-400' : 'text-red-400'}>
+                    {order.side.toUpperCase()}
+                  </span>
+                  <span className="text-gray-300">{formatPrice(order.price)}</span>
+                  <span className="text-gray-500 ml-auto text-[10px] uppercase tracking-wide">
+                    {pendingCancelOrderIds.has(order.id)
+                      ? <span className="text-amber-400 animate-pulse">cancelling</span>
+                      : order.status.replace('_', ' ')
+                    }
+                  </span>
+                  <button
+                    onClick={() => sim.cancelUserOrder(order.id)}
+                    className="text-red-500 hover:text-red-400"
+                    disabled={pendingCancelOrderIds.has(order.id)}
+                  >
+                    {pendingCancelOrderIds.has(order.id) ? '...' : '\u2715'}
+                  </button>
+                </div>
+                <div className="text-[10px] text-gray-500 mt-0.5">
+                  Qty {order.quantity} • Filled {order.filledQuantity} • Remaining {order.remainingQuantity}
+                </div>
+                {order.queuePosition != null && order.priceLevelOrderCount != null && (
+                  <div className="text-[10px] text-gray-500 mt-0.5">
+                    Queue {order.queuePosition}/{order.priceLevelOrderCount} @ {formatPrice(order.levelPrice ?? order.price)}
+                  </div>
+                )}
+                {order.enteredBookAt != null && order.submittedAt != null && order.enteredBookAt > order.submittedAt && (
+                  <div className="text-[10px] text-amber-400/60 mt-0.5">
+                    Delay: {order.enteredBookAt - order.submittedAt} ticks
+                  </div>
+                )}
               </div>
             ))
           )}

@@ -10,6 +10,12 @@ import {
   getBookPressure,
   summarizeExecution,
 } from './slippageModel.js';
+import {
+  normalizeOrderFields,
+  ORDER_STATUS,
+  setOrderStatus,
+  updateOrderAfterFill,
+} from './orderBook.js';
 
 export class MatchingEngine {
   constructor(orderBook, config = {}) {
@@ -31,35 +37,42 @@ export class MatchingEngine {
    * Returns { trades: Trade[], rested: boolean, summary: object | null }
    */
   processOrder(order, currentTick, marketState = {}) {
+    normalizeOrderFields(order);
     const trades = [];
     let summary = null;
 
     if (order.type === 'market') {
       const context = this._prepareMarketContext(order, marketState);
-      this._matchMarket(order, trades, currentTick);
+      this.sweepBookForMarketOrder(order, trades, currentTick);
       summary = summarizeExecution(order, trades, context);
     } else {
-      this._matchLimit(order, trades, currentTick);
+      this.matchIncomingOrder(order, trades, currentTick);
     }
 
     return {
       trades,
-      rested: order.status === 'open' && order.type === 'limit',
+      rested: order.type === 'limit' && order.remainingQuantity > 0,
       summary,
     };
   }
 
+  matchIncomingOrder(order, trades, currentTick) {
+    this._matchLimit(order, trades, currentTick);
+  }
+
   /** Match a market order — aggressively takes liquidity */
-  _matchMarket(order, trades, currentTick) {
+  sweepBookForMarketOrder(order, trades, currentTick) {
     const oppositeSide = order.side === 'buy'
       ? this.orderBook.asks
       : this.orderBook.bids;
 
     this._match(order, oppositeSide, trades, currentTick, null);
 
-    if (order.remainingSize > 0) {
-      // Market order with no more liquidity — killed
-      order.status = order.remainingSize < order.size ? 'partial' : 'cancelled';
+    if (order.remainingQuantity > 0) {
+      setOrderStatus(
+        order,
+        order.filledQuantity > 0 ? ORDER_STATUS.PARTIALLY_FILLED : ORDER_STATUS.CANCELLED
+      );
     }
   }
 
@@ -77,7 +90,7 @@ export class MatchingEngine {
 
     const bookPressure = getBookPressure(
       oppositeLevels,
-      order.size,
+      order.quantity,
       this.config,
       {
         ...marketState,
@@ -124,9 +137,11 @@ export class MatchingEngine {
     this._match(order, oppositeSide, trades, currentTick, limitPrice);
 
     // Rest unfilled portion
-    if (order.remainingSize > 0) {
-      this.orderBook.addOrder(order);
-    }
+    if (order.remainingQuantity > 0) this.restRemainingLimitOrder(order);
+  }
+
+  restRemainingLimitOrder(order) {
+    this.orderBook.addOrder(order);
   }
 
   /**
@@ -137,7 +152,7 @@ export class MatchingEngine {
   _match(incomingOrder, oppositeLevels, trades, currentTick, limitPrice) {
     let levelIdx = 0;
 
-    while (incomingOrder.remainingSize > 0 && levelIdx < oppositeLevels.length) {
+    while (incomingOrder.remainingQuantity > 0 && levelIdx < oppositeLevels.length) {
       const level = oppositeLevels[levelIdx];
 
       // Price check for limit orders
@@ -146,54 +161,7 @@ export class MatchingEngine {
         if (incomingOrder.side === 'sell' && level.price < limitPrice) break;
       }
 
-      let orderIdx = 0;
-      while (incomingOrder.remainingSize > 0 && orderIdx < level.orders.length) {
-        const restingOrder = level.orders[orderIdx];
-        const fillSize = Math.min(incomingOrder.remainingSize, restingOrder.remainingSize);
-        const fillPrice = restingOrder.price;
-
-        // Execute fill
-        incomingOrder.remainingSize -= fillSize;
-        restingOrder.remainingSize -= fillSize;
-
-        // Create trade record
-        const trade = {
-          id: ++this.tradeId,
-          price: fillPrice,
-          size: fillSize,
-          buyOrderId: incomingOrder.side === 'buy' ? incomingOrder.id : restingOrder.id,
-          sellOrderId: incomingOrder.side === 'sell' ? incomingOrder.id : restingOrder.id,
-          buyAgentId: incomingOrder.side === 'buy' ? incomingOrder.agentId : restingOrder.agentId,
-          sellAgentId: incomingOrder.side === 'sell' ? incomingOrder.agentId : restingOrder.agentId,
-          aggressor: incomingOrder.side,
-          tick: currentTick,
-          timestamp: Date.now(),
-        };
-        trades.push(trade);
-
-        // Update order statuses
-        if (restingOrder.remainingSize <= 0) {
-          restingOrder.status = 'filled';
-          // Remove from order map and agent orders
-          this.orderBook.orderMap.delete(restingOrder.id);
-          const agentSet = this.orderBook.agentOrders.get(restingOrder.agentId);
-          if (agentSet) {
-            agentSet.delete(restingOrder.id);
-            if (agentSet.size === 0) this.orderBook.agentOrders.delete(restingOrder.agentId);
-          }
-          level.orders.splice(orderIdx, 1);
-          // Don't increment orderIdx — next order shifted into position
-        } else {
-          restingOrder.status = 'partial';
-          orderIdx++;
-        }
-
-        if (incomingOrder.remainingSize <= 0) {
-          incomingOrder.status = 'filled';
-        } else {
-          incomingOrder.status = 'partial';
-        }
-      }
+      this.executeAgainstPriceLevel(incomingOrder, level, trades, currentTick);
 
       // Remove empty level
       if (level.orders.length === 0) {
@@ -205,6 +173,83 @@ export class MatchingEngine {
     }
   }
 
+  executeAgainstPriceLevel(incomingOrder, level, trades, currentTick) {
+    while (incomingOrder.remainingQuantity > 0 && level.orders.length > 0) {
+      const restingOrder = level.orders[0];
+      normalizeOrderFields(restingOrder);
+
+      const fillQuantity = Math.min(
+        incomingOrder.remainingQuantity,
+        restingOrder.remainingQuantity
+      );
+      const fillPrice = restingOrder.price;
+      const queueSnapshot = {
+        restingOrderQueuePosition: 1,
+        restingOrderSequenceNumber: restingOrder.sequenceNumber,
+        restingOrderTimestamp: restingOrder.timestamp,
+      };
+
+      const trade = this.executeMatch(
+        incomingOrder,
+        restingOrder,
+        fillPrice,
+        fillQuantity,
+        currentTick,
+        queueSnapshot
+      );
+      if (!trade) break;
+
+      trades.push(trade);
+
+      if (restingOrder.remainingQuantity <= 0) {
+        this.removeFilledOrder(level, 0, restingOrder);
+      }
+    }
+  }
+
+  executeMatch(takerOrder, makerOrder, price, quantity, currentTick, queueSnapshot = {}) {
+    const executedQuantity = Math.min(
+      quantity,
+      takerOrder.remainingQuantity,
+      makerOrder.remainingQuantity
+    );
+    if (executedQuantity <= 0) return null;
+
+    updateOrderAfterFill(takerOrder, executedQuantity);
+    updateOrderAfterFill(makerOrder, executedQuantity);
+
+    return {
+      id: ++this.tradeId,
+      price,
+      executionPrice: price,
+      quantity: executedQuantity,
+      size: executedQuantity,
+      buyOrderId: takerOrder.side === 'buy' ? takerOrder.id : makerOrder.id,
+      sellOrderId: takerOrder.side === 'sell' ? takerOrder.id : makerOrder.id,
+      buyAgentId: takerOrder.side === 'buy' ? takerOrder.agentId : makerOrder.agentId,
+      sellAgentId: takerOrder.side === 'sell' ? takerOrder.agentId : makerOrder.agentId,
+      aggressor: takerOrder.side,
+      tick: currentTick,
+      timestamp: Date.now(),
+      ...queueSnapshot,
+    };
+  }
+
+  updateOrderAfterFill(order, executedQuantity) {
+    return updateOrderAfterFill(order, executedQuantity);
+  }
+
+  removeFilledOrder(level, orderIdx, order) {
+    setOrderStatus(order, ORDER_STATUS.FILLED);
+    this.orderBook.orderMap.delete(order.id);
+    const agentSet = this.orderBook.agentOrders.get(order.agentId);
+    if (agentSet) {
+      agentSet.delete(order.id);
+      if (agentSet.size === 0) this.orderBook.agentOrders.delete(order.agentId);
+    }
+    level.orders.splice(orderIdx, 1);
+  }
+
   _fadeLevelLiquidity(oppositeLevels, levelIndex, fadeSize) {
     const level = oppositeLevels[levelIndex];
     if (!level || fadeSize <= 0) return 0;
@@ -214,20 +259,15 @@ export class MatchingEngine {
     for (let orderIdx = level.orders.length - 1; orderIdx >= 0 && remainingFade > 0; orderIdx--) {
       const restingOrder = level.orders[orderIdx];
       if (restingOrder.agentId === 'user') continue;
+      normalizeOrderFields(restingOrder);
 
-      const reduction = Math.min(restingOrder.remainingSize, remainingFade);
+      const reduction = Math.min(restingOrder.remainingQuantity, remainingFade);
 
-      restingOrder.remainingSize -= reduction;
+      updateOrderAfterFill(restingOrder, reduction);
       remainingFade -= reduction;
 
-      if (restingOrder.remainingSize <= 0) {
-        this.orderBook.orderMap.delete(restingOrder.id);
-        const agentSet = this.orderBook.agentOrders.get(restingOrder.agentId);
-        if (agentSet) {
-          agentSet.delete(restingOrder.id);
-          if (agentSet.size === 0) this.orderBook.agentOrders.delete(restingOrder.agentId);
-        }
-        level.orders.splice(orderIdx, 1);
+      if (restingOrder.remainingQuantity <= 0) {
+        this.removeFilledOrder(level, orderIdx, restingOrder);
       }
     }
 

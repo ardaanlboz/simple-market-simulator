@@ -41,12 +41,12 @@ export const defaultConfig = {
   quoteSizeRange: { min: 6, max: 24 },
   quoteRefreshInterval: 30,
   staleQuoteLifetime: 120,
-  inventorySkewStrength: 3,
+  inventorySkewStrength: 1,
   maxInventory: 150,
   makerCancellationDelay: 8,
   makerReactionDelay: 12,
-  probabilityOfJoiningBestBidAsk: 0.6,
-  probabilityOfQuotingOneTickAway: 0.25,
+  probabilityOfJoiningBestBidAsk: 0.2,
+  probabilityOfQuotingOneTickAway: 0.55,
 
   // Simulation speed
   tickInterval: 25, // ms between ticks at 1x speed
@@ -54,6 +54,19 @@ export const defaultConfig = {
 
   // Random seed
   seed: 42,
+
+  // Latency
+  enableLatency: true,
+  agentReactionDelayMin: 2,
+  agentReactionDelayMax: 10,
+  orderSubmissionDelayMin: 1,
+  orderSubmissionDelayMax: 5,
+  cancellationDelayMin: 1,
+  cancellationDelayMax: 8,
+  userOrderDelayMin: 0,
+  userOrderDelayMax: 3,
+  makerSubmissionDelayMin: 0,
+  makerSubmissionDelayMax: 2,
 
   // Manual trading
   userStartingBalance: 10000,
@@ -89,6 +102,19 @@ export const configRanges = {
   seed: { min: 1, max: 99999, step: 1, label: "Random Seed" },
 };
 
+export const latencyConfigRanges = {
+  agentReactionDelayMin: { min: 0, max: 50, step: 1, label: "Agent Reaction Min" },
+  agentReactionDelayMax: { min: 0, max: 50, step: 1, label: "Agent Reaction Max" },
+  orderSubmissionDelayMin: { min: 0, max: 30, step: 1, label: "Order Submit Min" },
+  orderSubmissionDelayMax: { min: 0, max: 30, step: 1, label: "Order Submit Max" },
+  cancellationDelayMin: { min: 0, max: 30, step: 1, label: "Cancel Delay Min" },
+  cancellationDelayMax: { min: 0, max: 30, step: 1, label: "Cancel Delay Max" },
+  userOrderDelayMin: { min: 0, max: 20, step: 1, label: "User Delay Min" },
+  userOrderDelayMax: { min: 0, max: 20, step: 1, label: "User Delay Max" },
+  makerSubmissionDelayMin: { min: 0, max: 20, step: 1, label: "Maker Submit Min" },
+  makerSubmissionDelayMax: { min: 0, max: 20, step: 1, label: "Maker Submit Max" },
+};
+
 export const marketMakerConfigRanges = {
   numberOfMarketMakers: { min: 1, max: 20, step: 1, label: "Number of Makers" },
   baseSpreadTicks: { min: 1, max: 12, step: 1, label: "Base Spread Ticks" },
@@ -96,7 +122,7 @@ export const marketMakerConfigRanges = {
   quoteSizeRangeMax: { min: 1, max: 400, step: 1, label: "Max Quote Size" },
   quoteRefreshInterval: { min: 5, max: 300, step: 5, label: "Refresh Interval" },
   staleQuoteLifetime: { min: 20, max: 600, step: 10, label: "Stale Quote Lifetime" },
-  inventorySkewStrength: { min: 0, max: 12, step: 0.5, label: "Inventory Skew" },
+  inventorySkewStrength: { min: 0, max: 6, step: 0.25, label: "Inventory Skew" },
   maxInventory: { min: 10, max: 1000, step: 10, label: "Max Inventory" },
   makerCancellationDelay: { min: 1, max: 60, step: 1, label: "Cancel Delay" },
   makerReactionDelay: { min: 1, max: 120, step: 1, label: "Reaction Delay" },
