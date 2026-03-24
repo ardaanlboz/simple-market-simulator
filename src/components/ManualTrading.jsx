@@ -159,16 +159,25 @@ export default function ManualTrading({ sim }) {
       </div>
 
       {/* Trade history */}
-      <div className="flex flex-col w-48 shrink-0">
+      <div className="flex flex-col w-56 shrink-0">
         <div className="text-gray-400 font-bold mb-1">My Trades ({userTradeHistory.length})</div>
         <div className="flex-1 overflow-y-auto scrollbar-thin">
           {userTradeHistory.slice(-20).reverse().map((t, i) => (
-            <div key={i} className="flex items-center gap-2 py-0.5">
-              <span className={t.side === 'buy' ? 'text-green-400' : 'text-red-400'}>
-                {t.side === 'buy' ? 'B' : 'S'}
-              </span>
-              <span className="text-gray-300">{formatPrice(t.price)}</span>
-              <span className="text-gray-500">x{t.size}</span>
+            <div key={i} className="py-1 border-b border-gray-800/40 last:border-b-0">
+              <div className="flex items-center gap-2">
+                <span className={t.side === 'buy' ? 'text-green-400' : 'text-red-400'}>
+                  {t.side === 'buy' ? 'B' : 'S'}
+                </span>
+                <span className="text-gray-300">{formatPrice(t.price)}</span>
+                <span className="text-gray-500">x{t.size}</span>
+              </div>
+              {t.slippageBps != null && (
+                <div className="text-[10px] text-gray-500 mt-0.5">
+                  Slip vs mid {t.slippageBps.toFixed(1)} bps
+                  {t.levelsSwept > 1 ? ` • ${t.levelsSwept} lvls` : ''}
+                  {t.quoteFadeVolume > 0 ? ` • faded ${t.quoteFadeVolume}` : ''}
+                </div>
+              )}
             </div>
           ))}
         </div>

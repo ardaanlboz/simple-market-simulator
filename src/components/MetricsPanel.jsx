@@ -11,10 +11,14 @@ export default function MetricsPanel() {
   const totalOrders = useSimulationStore((s) => s.totalOrders);
   const totalBidVolume = useSimulationStore((s) => s.totalBidVolume);
   const totalAskVolume = useSimulationStore((s) => s.totalAskVolume);
+  const makerStats = useSimulationStore((s) => s.makerStats);
   const patterns = useSimulationStore((s) => s.patterns);
   const config = useSimulationStore((s) => s.config);
 
   const spreadBps = spread != null && midPrice ? (spread / midPrice) * 10000 : null;
+  const makerSpreadBps = makerStats.averageSpreadQuoted && midPrice
+    ? (makerStats.averageSpreadQuoted / midPrice) * 10000
+    : null;
 
   return (
     <div className="flex gap-6 h-full text-xs overflow-x-auto">
@@ -35,6 +39,41 @@ export default function MetricsPanel() {
         <Metric label="Bid Volume" value={formatSize(totalBidVolume)} color="#22c55e" />
         <Metric label="Ask Volume" value={formatSize(totalAskVolume)} color="#ef4444" />
       </div>
+
+      {config.enableMarketMakers && (
+        <div className="flex flex-col gap-1 shrink-0">
+          <div className="text-gray-400 font-bold mb-1">Market Makers</div>
+          <Metric label="Count" value={makerStats.makerCount.toLocaleString()} />
+          <Metric label="Resting Vol" value={formatSize(makerStats.totalRestingVolume)} color="#60a5fa" />
+          <Metric label="Maker Fills" value={makerStats.fillCount.toLocaleString()} />
+          <Metric
+            label="Quoted Spread"
+            value={makerStats.averageSpreadQuoted > 0
+              ? `${formatPrice(makerStats.averageSpreadQuoted)} (${makerSpreadBps?.toFixed(1)} bps)`
+              : '—'}
+          />
+          <Metric
+            label="Top Of Book"
+            value={makerStats.spreadSetByMakers
+              ? 'Both Sides'
+              : makerStats.bestBidControlled || makerStats.bestAskControlled
+                ? `${makerStats.bestBidControlled ? 'Bid' : ''}${makerStats.bestBidControlled && makerStats.bestAskControlled ? ' / ' : ''}${makerStats.bestAskControlled ? 'Ask' : ''}`
+                : 'No'}
+            color={makerStats.spreadSetByMakers ? '#22c55e' : '#9ca3af'}
+          />
+        </div>
+      )}
+
+      {config.enableMarketMakers && (
+        <div className="flex flex-col gap-1 shrink-0">
+          <div className="text-gray-400 font-bold mb-1">Maker Inventory</div>
+          <Metric label="Net" value={makerStats.netInventory.toLocaleString()} />
+          <Metric label="Avg" value={makerStats.averageInventory.toFixed(1)} />
+          <Metric label="Long / Short / Flat" value={`${makerStats.longCount} / ${makerStats.shortCount} / ${makerStats.flatCount}`} />
+          <Metric label="Range" value={`${makerStats.minInventory} to ${makerStats.maxInventory}`} />
+          <Metric label="Bid / Ask Vol" value={`${formatSize(makerStats.makerRestingBidVolume)} / ${formatSize(makerStats.makerRestingAskVolume)}`} />
+        </div>
+      )}
 
       {/* Order flow */}
       <div className="flex flex-col gap-1 shrink-0">

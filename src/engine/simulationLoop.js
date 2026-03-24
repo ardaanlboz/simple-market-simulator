@@ -14,6 +14,7 @@ import { MatchingEngine } from './matchingEngine.js';
 import { MetricsEngine } from './metricsEngine.js';
 import { PatternDetector } from './patternDetector.js';
 import { RandomAgentSystem } from '../agents/randomAgentSystem.js';
+import { MarketMakerSystem } from '../agents/marketMakerSystem.js';
 import { SeededRng } from './seededRng.js';
 
 function sampleOffset(rng, tickSize, meanTicks) {
@@ -39,11 +40,13 @@ export class SimulationLoop {
     this.onUpdate = onUpdate;
 
     this.rng = new SeededRng(config.seed);
+    this.marketMakerRng = new SeededRng(config.seed + 1009);
     this.orderBook = new OrderBook(config.tickSize);
-    this.matchingEngine = new MatchingEngine(this.orderBook);
+    this.matchingEngine = new MatchingEngine(this.orderBook, config);
     this.metricsEngine = new MetricsEngine(config);
     this.patternDetector = new PatternDetector(config);
     this.agentSystem = new RandomAgentSystem(this.rng, config);
+    this.marketMakerSystem = new MarketMakerSystem(this.marketMakerRng, config);
 
     this.tick = 0;
     this.lastPrice = config.initialPrice;
@@ -147,11 +150,13 @@ export class SimulationLoop {
     this.lastPrice = this.config.initialPrice;
     resetOrderIdCounter();
     this.rng = new SeededRng(this.config.seed);
+    this.marketMakerRng = new SeededRng(this.config.seed + 1009);
     this.orderBook = new OrderBook(this.config.tickSize);
-    this.matchingEngine = new MatchingEngine(this.orderBook);
+    this.matchingEngine = new MatchingEngine(this.orderBook, this.config);
     this.metricsEngine = new MetricsEngine(this.config);
     this.patternDetector = new PatternDetector(this.config);
     this.agentSystem = new RandomAgentSystem(this.rng, this.config);
+    this.marketMakerSystem = new MarketMakerSystem(this.marketMakerRng, this.config);
     this.history = [];
     this._seedInitialLiquidity();
     this._pushUpdate();
@@ -170,10 +175,29 @@ export class SimulationLoop {
   updateConfig(newConfig) {
     this.config = { ...this.config, ...newConfig };
     this.agentSystem.updateConfig(this.config);
+    this.marketMakerSystem.updateConfig(newConfig, this.orderBook, this.tick);
+    this.matchingEngine.updateConfig(this.config);
     this.metricsEngine.updateConfig(this.config);
 
     if (this.isRunning && !this.isPaused && newConfig.tickInterval != null) {
       this._scheduleLoop();
+    }
+
+    if (
+      newConfig.enableMarketMakers != null
+      || newConfig.numberOfMarketMakers != null
+      || newConfig.baseSpreadTicks != null
+      || newConfig.quoteRefreshInterval != null
+      || newConfig.staleQuoteLifetime != null
+      || newConfig.makerCancellationDelay != null
+      || newConfig.makerReactionDelay != null
+      || newConfig.maxInventory != null
+      || newConfig.inventorySkewStrength != null
+      || newConfig.probabilityOfJoiningBestBidAsk != null
+      || newConfig.probabilityOfQuotingOneTickAway != null
+      || newConfig.quoteSizeRange != null
+    ) {
+      this._pushUpdate();
     }
   }
 
@@ -224,12 +248,21 @@ export class SimulationLoop {
 
     // 2. Agents generate orders
     const midPrice = this.orderBook.midPrice || this.lastPrice;
+    const makerOrders = this.marketMakerSystem.tick(
+      this.tick,
+      this._getExecutionContext(),
+      this.orderBook
+    );
     const agentOrders = this.agentSystem.tick(this.tick, midPrice, this.orderBook);
 
     // 3. Process each order through matching engine
     const allTrades = [];
-    for (const order of agentOrders) {
-      const { trades } = this.matchingEngine.processOrder(order, this.tick);
+    for (const order of [...makerOrders, ...agentOrders]) {
+      const { trades } = this.matchingEngine.processOrder(
+        order,
+        this.tick,
+        this._getExecutionContext()
+      );
       allTrades.push(...trades);
     }
 
@@ -240,6 +273,7 @@ export class SimulationLoop {
 
     // 5. Update metrics
     this.metricsEngine.processTick(this.tick, allTrades, this.orderBook, this.lastPrice);
+    this.marketMakerSystem.handleFills(allTrades, this.tick);
 
     // 6. Detect patterns periodically
     if (this.tick % 50 === 0) {
@@ -290,8 +324,10 @@ export class SimulationLoop {
       totalOrders: this.orderBook.totalOrders,
       totalBidVolume: this.orderBook.totalBidVolume,
       totalAskVolume: this.orderBook.totalAskVolume,
+      makerStats: this.marketMakerSystem.getMetrics(this.orderBook, this.lastPrice),
       patterns: this.patternDetector.getPatterns(),
       history: this.history,
+      userOrders: this._getUserOrdersSnapshot(),
       isRunning: this.isRunning,
       isPaused: this.isPaused,
     });
@@ -299,23 +335,55 @@ export class SimulationLoop {
 
   /** Process a user-submitted order */
   processUserOrder(order) {
-    const { trades } = this.matchingEngine.processOrder(order, this.tick);
+    const result = this.matchingEngine.processOrder(
+      order,
+      this.tick,
+      this._getExecutionContext()
+    );
+    const { trades } = result;
     if (trades.length > 0) {
       this.lastPrice = trades[trades.length - 1].price;
       this.metricsEngine.processTrades(this.tick, trades);
+      this.marketMakerSystem.handleFills(trades, this.tick);
     }
     this._pushUpdate();
-    return trades;
+    return result;
   }
 
   /** Cancel a user order */
   cancelUserOrder(orderId) {
-    return this.orderBook.cancelOrder(orderId);
+    const cancelled = this.orderBook.cancelOrder(orderId);
+    this._pushUpdate();
+    return cancelled;
   }
 
   /** Clean up */
   destroy() {
     if (this.intervalId) clearInterval(this.intervalId);
     this.isRunning = false;
+  }
+
+  _getExecutionContext() {
+    const recentTrades = this.metricsEngine.recentTrades;
+    const lookbackWindow = recentTrades.slice(-8);
+    const firstPrice = lookbackWindow[0]?.price ?? this.lastPrice;
+    const lastPrice = lookbackWindow[lookbackWindow.length - 1]?.price ?? this.lastPrice;
+
+    return {
+      lastPrice: this.lastPrice,
+      midPrice: this.orderBook.midPrice || this.lastPrice,
+      spread: this.orderBook.spread,
+      volatility: this.metricsEngine.volatility,
+      priceVelocity: Math.abs(lastPrice - firstPrice),
+    };
+  }
+
+  _getUserOrdersSnapshot() {
+    return this.orderBook
+      .getAgentOrderIds('user')
+      .map((orderId) => this.orderBook.getOrder(orderId))
+      .filter(Boolean)
+      .sort((a, b) => a.createdAt - b.createdAt)
+      .map((order) => ({ ...order }));
   }
 }

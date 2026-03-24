@@ -1,11 +1,23 @@
 import { useState } from 'react';
 import { useSimulationStore } from '../store/simulationStore.js';
-import { configRanges } from '../data/defaultConfig.js';
+import { configRanges, marketMakerConfigRanges } from '../data/defaultConfig.js';
 
 export default function SimulationControls({ sim }) {
   const { isRunning, isPaused, tick, speed, config } = useSimulationStore();
   const setSpeed = useSimulationStore((s) => s.setSpeed);
   const [expanded, setExpanded] = useState(false);
+
+  const updateQuoteSize = (key, value) => {
+    const nextRange = {
+      ...(config.quoteSizeRange || { min: 1, max: 1 }),
+      [key]: value,
+    };
+    if (nextRange.min > nextRange.max) {
+      if (key === 'min') nextRange.max = value;
+      else nextRange.min = value;
+    }
+    sim.updateConfig({ quoteSizeRange: nextRange });
+  };
 
   const handleStart = () => {
     if (!isRunning) sim.start();
@@ -98,6 +110,67 @@ export default function SimulationControls({ sim }) {
               />
             </div>
           ))}
+
+          <div className="pt-2 mt-1 border-t border-gray-800">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-xs text-gray-300 font-semibold">Market Makers</span>
+              <button
+                type="button"
+                onClick={() => sim.updateConfig({ enableMarketMakers: !config.enableMarketMakers })}
+                className="px-2 py-1 rounded text-[11px] transition-colors"
+                style={{
+                  background: config.enableMarketMakers ? '#14532d' : '#374151',
+                  color: config.enableMarketMakers ? '#bbf7d0' : '#9ca3af',
+                }}
+              >
+                {config.enableMarketMakers ? 'Enabled' : 'Disabled'}
+              </button>
+            </div>
+
+            {config.enableMarketMakers && (
+              <div className="flex flex-col gap-2">
+                {Object.entries(marketMakerConfigRanges).map(([key, range]) => {
+                  const value = key === 'quoteSizeRangeMin'
+                    ? config.quoteSizeRange?.min
+                    : key === 'quoteSizeRangeMax'
+                      ? config.quoteSizeRange?.max
+                      : config[key];
+
+                  return (
+                    <div key={key}>
+                      <div className="flex justify-between text-xs mb-1">
+                        <span className="text-gray-400">{range.label}</span>
+                        <span className="text-gray-300 font-mono">
+                          {typeof value === 'number' && value % 1 !== 0
+                            ? value.toFixed(2)
+                            : value}
+                        </span>
+                      </div>
+                      <input
+                        type="range"
+                        min={range.min}
+                        max={range.max}
+                        step={range.step}
+                        value={value}
+                        onChange={(e) => {
+                          const nextValue = parseFloat(e.target.value);
+                          if (key === 'quoteSizeRangeMin') {
+                            updateQuoteSize('min', nextValue);
+                          } else if (key === 'quoteSizeRangeMax') {
+                            updateQuoteSize('max', nextValue);
+                          } else {
+                            sim.updateConfig({ [key]: nextValue });
+                          }
+                        }}
+                        className="w-full h-1 rounded-lg appearance-none cursor-pointer"
+                        style={{ accentColor: '#22c55e' }}
+                      />
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
         </div>
       )}
     </div>

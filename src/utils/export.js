@@ -43,7 +43,7 @@ export function exportCandles(candles) {
 export function exportTrades(trades) {
   exportCSV(
     trades,
-    ['id', 'price', 'size', 'aggressor', 'tick', 'timestamp'],
+    ['id', 'price', 'size', 'aggressor', 'buyAgentId', 'sellAgentId', 'tick', 'timestamp'],
     'trades.csv'
   );
 }

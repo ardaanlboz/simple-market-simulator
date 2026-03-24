@@ -85,22 +85,35 @@ export function useSimulation() {
       lifetime: type === 'limit' ? 5000 : null,
     });
 
-    const trades = engine.processUserOrder(order);
+    const { trades, summary } = engine.processUserOrder(order);
 
     // Record fills
-    for (const trade of trades) {
+    if (type === 'market' && summary?.filledSize > 0) {
       store.getState().recordUserTrade({
         side,
-        price: trade.price,
-        size: trade.size,
-        tick: trade.tick,
-        timestamp: trade.timestamp,
+        price: summary.averageFillPrice,
+        size: summary.filledSize,
+        tick: summary.tick ?? state.tick,
+        timestamp: summary.timestamp,
+        arrivalPrice: summary.arrivalPrice,
+        referencePrice: summary.referencePrice,
+        slippage: summary.totalSlippage,
+        slippageBps: summary.totalSlippageBps,
+        impactSlippage: summary.quoteSlippage,
+        impactSlippageBps: summary.quoteSlippageBps,
+        levelsSwept: summary.levelsSwept,
+        quoteFadeVolume: summary.quoteFadeVolume,
       });
-    }
-
-    // Track resting limit orders
-    if (type === 'limit' && order.remainingSize > 0 && order.status === 'open') {
-      store.getState().addUserOrder(order);
+    } else {
+      for (const trade of trades) {
+        store.getState().recordUserTrade({
+          side,
+          price: trade.price,
+          size: trade.size,
+          tick: trade.tick,
+          timestamp: trade.timestamp,
+        });
+      }
     }
   }, [store]);
 
@@ -108,8 +121,7 @@ export function useSimulation() {
     const engine = engineRef.current;
     if (!engine) return;
     engine.cancelUserOrder(orderId);
-    store.getState().removeUserOrder(orderId);
-  }, [store]);
+  }, []);
 
   const getEngine = useCallback(() => engineRef.current, []);
 

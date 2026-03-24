@@ -8,6 +8,92 @@
 
 let nextOrderId = 1;
 
+export const ORDER_STATUS = {
+  OPEN: 'open',
+  PARTIALLY_FILLED: 'partially_filled',
+  FILLED: 'filled',
+  CANCELLED: 'cancelled',
+  EXPIRED: 'expired',
+};
+
+function clampQuantity(value) {
+  return Math.max(0, Number.isFinite(value) ? value : 0);
+}
+
+function toCanonicalStatus(status) {
+  if (status === 'partial') return ORDER_STATUS.PARTIALLY_FILLED;
+  return status;
+}
+
+function deriveOrderStatus(order) {
+  if (order.remainingQuantity <= 0) return ORDER_STATUS.FILLED;
+  if (order.filledQuantity > 0) return ORDER_STATUS.PARTIALLY_FILLED;
+  return ORDER_STATUS.OPEN;
+}
+
+export function normalizeOrderFields(order) {
+  const quantity = clampQuantity(order.quantity ?? order.size);
+  let filledQuantity = order.filledQuantity;
+  let remainingQuantity = order.remainingQuantity ?? order.remainingSize;
+
+  if (!Number.isFinite(filledQuantity) && !Number.isFinite(remainingQuantity)) {
+    filledQuantity = 0;
+    remainingQuantity = quantity;
+  } else if (!Number.isFinite(filledQuantity)) {
+    remainingQuantity = clampQuantity(remainingQuantity);
+    filledQuantity = clampQuantity(quantity - remainingQuantity);
+  } else if (!Number.isFinite(remainingQuantity)) {
+    filledQuantity = clampQuantity(filledQuantity);
+    remainingQuantity = clampQuantity(quantity - filledQuantity);
+  } else {
+    filledQuantity = clampQuantity(filledQuantity);
+    remainingQuantity = clampQuantity(remainingQuantity);
+  }
+
+  if (filledQuantity + remainingQuantity !== quantity) {
+    remainingQuantity = clampQuantity(quantity - filledQuantity);
+  }
+
+  const timestamp = order.timestamp ?? order.createdAt ?? 0;
+  const status = toCanonicalStatus(order.status);
+
+  order.quantity = quantity;
+  order.size = quantity;
+  order.filledQuantity = filledQuantity;
+  order.remainingQuantity = remainingQuantity;
+  order.remainingSize = remainingQuantity;
+  order.timestamp = timestamp;
+  order.createdAt = timestamp;
+
+  if (status === ORDER_STATUS.CANCELLED || status === ORDER_STATUS.EXPIRED) {
+    order.status = status;
+  } else {
+    order.status = deriveOrderStatus(order);
+  }
+
+  return order;
+}
+
+export function updateOrderAfterFill(order, executedQuantity) {
+  normalizeOrderFields(order);
+
+  const actualFill = Math.min(order.remainingQuantity, clampQuantity(executedQuantity));
+  if (actualFill <= 0) return 0;
+
+  order.filledQuantity += actualFill;
+  order.remainingQuantity = clampQuantity(order.quantity - order.filledQuantity);
+  order.remainingSize = order.remainingQuantity;
+  order.status = deriveOrderStatus(order);
+
+  return actualFill;
+}
+
+export function setOrderStatus(order, status) {
+  normalizeOrderFields(order);
+  order.status = toCanonicalStatus(status);
+  return order;
+}
+
 export function createOrderId() {
   return `ORD-${nextOrderId++}`;
 }
@@ -20,27 +106,30 @@ export function resetOrderIdCounter() {
  * Create a new order object.
  */
 export function createOrder({
+  id = null,
   side,
   type,
   price,
   size,
+  quantity,
   agentId,
   tick,
+  timestamp,
   lifetime = null,
 }) {
-  const id = createOrderId();
-  return {
-    id,
+  return normalizeOrderFields({
+    id: id ?? createOrderId(),
     side,        // 'buy' | 'sell'
     type,        // 'limit' | 'market'
     price: type === 'market' ? null : price,
-    size,
-    remainingSize: size,
+    quantity: quantity ?? size,
+    filledQuantity: 0,
+    remainingQuantity: quantity ?? size,
     agentId,
-    createdAt: tick,
+    timestamp: timestamp ?? tick,
     expiresAt: lifetime != null ? tick + lifetime : null,
-    status: 'open', // 'open' | 'partial' | 'filled' | 'cancelled' | 'expired'
-  };
+    status: ORDER_STATUS.OPEN,
+  });
 }
 
 /**
@@ -102,7 +191,8 @@ export class OrderBook {
 
   /** Add a limit order to the book (after matching) */
   addOrder(order) {
-    if (order.type !== 'limit' || order.remainingSize <= 0) return;
+    normalizeOrderFields(order);
+    if (order.type !== 'limit' || order.remainingQuantity <= 0) return;
 
     const side = order.side === 'buy' ? this.bids : this.asks;
     const descending = order.side === 'buy';
@@ -131,6 +221,7 @@ export class OrderBook {
   removeOrder(orderId) {
     const order = this.orderMap.get(orderId);
     if (!order) return null;
+    normalizeOrderFields(order);
 
     const side = order.side === 'buy' ? this.bids : this.asks;
     const price = order.price;
@@ -163,7 +254,7 @@ export class OrderBook {
   cancelOrder(orderId) {
     const order = this.removeOrder(orderId);
     if (order) {
-      order.status = 'cancelled';
+      setOrderStatus(order, ORDER_STATUS.CANCELLED);
     }
     return order;
   }
@@ -178,7 +269,7 @@ export class OrderBook {
     }
     for (const order of expired) {
       this.removeOrder(order.id);
-      order.status = 'expired';
+      setOrderStatus(order, ORDER_STATUS.EXPIRED);
     }
     return expired;
   }
@@ -198,13 +289,13 @@ export class OrderBook {
   getDepth(levels = 20) {
     const bidLevels = this.bids.slice(0, levels).map(l => ({
       price: l.price,
-      size: l.orders.reduce((sum, o) => sum + o.remainingSize, 0),
+      size: l.orders.reduce((sum, o) => sum + normalizeOrderFields(o).remainingQuantity, 0),
       count: l.orders.length,
     }));
 
     const askLevels = this.asks.slice(0, levels).map(l => ({
       price: l.price,
-      size: l.orders.reduce((sum, o) => sum + o.remainingSize, 0),
+      size: l.orders.reduce((sum, o) => sum + normalizeOrderFields(o).remainingQuantity, 0),
       count: l.orders.length,
     }));
 
@@ -215,14 +306,14 @@ export class OrderBook {
   getCumulativeDepth(levels = 50) {
     let cumBid = 0;
     const bidDepth = this.bids.slice(0, levels).map(l => {
-      const size = l.orders.reduce((sum, o) => sum + o.remainingSize, 0);
+      const size = l.orders.reduce((sum, o) => sum + normalizeOrderFields(o).remainingQuantity, 0);
       cumBid += size;
       return { price: l.price, size, cumulative: cumBid };
     });
 
     let cumAsk = 0;
     const askDepth = this.asks.slice(0, levels).map(l => {
-      const size = l.orders.reduce((sum, o) => sum + o.remainingSize, 0);
+      const size = l.orders.reduce((sum, o) => sum + normalizeOrderFields(o).remainingQuantity, 0);
       cumAsk += size;
       return { price: l.price, size, cumulative: cumAsk };
     });
@@ -239,7 +330,7 @@ export class OrderBook {
   get totalBidVolume() {
     let vol = 0;
     for (const level of this.bids) {
-      for (const o of level.orders) vol += o.remainingSize;
+      for (const o of level.orders) vol += normalizeOrderFields(o).remainingQuantity;
     }
     return vol;
   }
@@ -248,7 +339,7 @@ export class OrderBook {
   get totalAskVolume() {
     let vol = 0;
     for (const level of this.asks) {
-      for (const o of level.orders) vol += o.remainingSize;
+      for (const o of level.orders) vol += normalizeOrderFields(o).remainingQuantity;
     }
     return vol;
   }
